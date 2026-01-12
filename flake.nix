@@ -55,9 +55,6 @@
             cargo-watch
             rust-analyzer
             ffmpeg # For ffprobe media info extraction
-            nodejs
-            node-gyp
-            npm
           ];
 
           env = {

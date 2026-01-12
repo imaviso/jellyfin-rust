@@ -114,6 +114,10 @@ pub struct ScannerConfig {
     /// Run a quick scan on startup after library initialization (default: false)
     /// Note: New libraries are always scanned on creation
     pub scan_on_startup: bool,
+
+    /// Video file extensions to scan (lowercase, without dots)
+    /// Default: mkv, mp4, avi, mov, wmv, flv, webm, m4v, mpg, mpeg, ts
+    pub video_extensions: Vec<String>,
 }
 
 impl Default for ScannerConfig {
@@ -123,6 +127,33 @@ impl Default for ScannerConfig {
             quick_scan_interval_minutes: 15,
             full_scan_interval_hours: 24,
             scan_on_startup: false,
+            video_extensions: vec![
+                "mkv".to_string(),
+                "mp4".to_string(),
+                "avi".to_string(),
+                "mov".to_string(),
+                "wmv".to_string(),
+                "flv".to_string(),
+                "webm".to_string(),
+                "m4v".to_string(),
+                "mpg".to_string(),
+                "mpeg".to_string(),
+                "ts".to_string(),
+                // Additional formats often requested
+                "m2ts".to_string(),
+                "mts".to_string(),
+                "vob".to_string(),
+                "ogm".to_string(),
+                "ogv".to_string(),
+                "divx".to_string(),
+                "xvid".to_string(),
+                "rmvb".to_string(),
+                "rm".to_string(),
+                "asf".to_string(),
+                "3gp".to_string(),
+                "3g2".to_string(),
+                "f4v".to_string(),
+            ],
         }
     }
 }

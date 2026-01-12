@@ -73,40 +73,43 @@ async fn get_genres(
     let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).min(500);
 
-    // Get genres with item counts
-    let mut sql = String::from(
-        "SELECT g.id, g.name, COUNT(ig.item_id) as item_count 
-         FROM genres g
-         LEFT JOIN item_genres ig ON g.id = ig.genre_id
-         LEFT JOIN media_items m ON ig.item_id = m.id",
-    );
-
-    // Filter by library if parent_id is provided
-    if let Some(ref parent_id) = query.parent_id {
-        sql.push_str(&format!(
-            " AND m.library_id = '{}'",
-            parent_id.replace('\'', "''")
-        ));
-    }
-
-    sql.push_str(" GROUP BY g.id, g.name");
-
-    // Search term filter
-    if let Some(ref term) = query.search_term {
-        let escaped = term.replace('\'', "''").to_lowercase();
-        sql.push_str(&format!(" HAVING LOWER(g.name) LIKE '%{}%'", escaped));
-    }
-
-    // Sorting
+    // Determine sort order (whitelist to prevent injection)
     let sort_order = if query.sort_order.as_deref() == Some("Descending") {
         "DESC"
     } else {
         "ASC"
     };
-    sql.push_str(&format!(
-        " ORDER BY g.name {} LIMIT {} OFFSET {}",
-        sort_order, limit, start_index
-    ));
+
+    // Build query using QueryBuilder for safe parameter binding
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+        "SELECT g.id, g.name, COUNT(ig.item_id) as item_count 
+         FROM genres g
+         LEFT JOIN item_genres ig ON g.id = ig.genre_id
+         LEFT JOIN media_items m ON ig.item_id = m.id
+         WHERE 1=1",
+    );
+
+    // Filter by library if parent_id is provided
+    if let Some(ref parent_id) = query.parent_id {
+        qb.push(" AND m.library_id = ").push_bind(parent_id.clone());
+    }
+
+    qb.push(" GROUP BY g.id, g.name");
+
+    // Search term filter using HAVING
+    if let Some(ref term) = query.search_term {
+        let search_pattern = format!("%{}%", term.to_lowercase());
+        qb.push(" HAVING LOWER(g.name) LIKE ")
+            .push_bind(search_pattern);
+    }
+
+    // Sorting and pagination (sort_order is whitelisted above)
+    qb.push(" ORDER BY g.name ")
+        .push(sort_order)
+        .push(" LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(start_index);
 
     #[derive(sqlx::FromRow)]
     struct GenreRow {
@@ -115,7 +118,8 @@ async fn get_genres(
         item_count: i32,
     }
 
-    let genres: Vec<GenreRow> = sqlx::query_as(&sql)
+    let genres: Vec<GenreRow> = qb
+        .build_query_as()
         .fetch_all(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -244,36 +248,41 @@ async fn get_studios(
     let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).min(500);
 
-    let mut sql = String::from(
-        "SELECT s.id, s.name, COUNT(ist.item_id) as item_count 
-         FROM studios s
-         LEFT JOIN item_studios ist ON s.id = ist.studio_id
-         LEFT JOIN media_items m ON ist.item_id = m.id",
-    );
-
-    if let Some(ref parent_id) = query.parent_id {
-        sql.push_str(&format!(
-            " AND m.library_id = '{}'",
-            parent_id.replace('\'', "''")
-        ));
-    }
-
-    sql.push_str(" GROUP BY s.id, s.name");
-
-    if let Some(ref term) = query.search_term {
-        let escaped = term.replace('\'', "''").to_lowercase();
-        sql.push_str(&format!(" HAVING LOWER(s.name) LIKE '%{}%'", escaped));
-    }
-
+    // Determine sort order (whitelist to prevent injection)
     let sort_order = if query.sort_order.as_deref() == Some("Descending") {
         "DESC"
     } else {
         "ASC"
     };
-    sql.push_str(&format!(
-        " ORDER BY s.name {} LIMIT {} OFFSET {}",
-        sort_order, limit, start_index
-    ));
+
+    // Build query using QueryBuilder for safe parameter binding
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+        "SELECT s.id, s.name, COUNT(ist.item_id) as item_count 
+         FROM studios s
+         LEFT JOIN item_studios ist ON s.id = ist.studio_id
+         LEFT JOIN media_items m ON ist.item_id = m.id
+         WHERE 1=1",
+    );
+
+    if let Some(ref parent_id) = query.parent_id {
+        qb.push(" AND m.library_id = ").push_bind(parent_id.clone());
+    }
+
+    qb.push(" GROUP BY s.id, s.name");
+
+    if let Some(ref term) = query.search_term {
+        let search_pattern = format!("%{}%", term.to_lowercase());
+        qb.push(" HAVING LOWER(s.name) LIKE ")
+            .push_bind(search_pattern);
+    }
+
+    // Sorting and pagination (sort_order is whitelisted above)
+    qb.push(" ORDER BY s.name ")
+        .push(sort_order)
+        .push(" LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(start_index);
 
     #[derive(sqlx::FromRow)]
     struct StudioRow {
@@ -282,7 +291,8 @@ async fn get_studios(
         item_count: i32,
     }
 
-    let studios: Vec<StudioRow> = sqlx::query_as(&sql)
+    let studios: Vec<StudioRow> = qb
+        .build_query_as()
         .fetch_all(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

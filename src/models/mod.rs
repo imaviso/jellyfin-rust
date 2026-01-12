@@ -20,6 +20,8 @@ pub struct Session {
     pub device_name: String,
     pub client: String,
     pub created_at: String,
+    pub last_activity: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

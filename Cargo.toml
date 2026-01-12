@@ -33,8 +33,9 @@ rand_core = { version = "0.6", features = ["std"] }
 # Regex for filename parsing
 regex = "1"
 
-# Async utilities for streaming
-tokio-util = { version = "0.7", features = ["io"] }
+# Async utilities for streaming and cancellation
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+futures = "0.3"
 
 # HTTP client (for metadata fetching) - using rustls for static compilation
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }

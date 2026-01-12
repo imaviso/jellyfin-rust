@@ -1,45 +1,33 @@
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 
-/// Configure SQLite for optimal performance
-/// This should be called once per connection, typically via connection options
+/// Configure SQLite PRAGMAs for a single connection
+///
+/// NOTE: Most PRAGMAs are now configured via SqlitePoolOptions::after_connect
+/// in main.rs to ensure ALL connections in the pool get the same settings.
+///
+/// This function is kept for backwards compatibility and can be used to
+/// verify the configuration on a specific connection.
 pub async fn configure_connection(pool: &SqlitePool) -> Result<()> {
-    // WAL mode for better concurrent read/write performance
-    sqlx::query("PRAGMA journal_mode = WAL")
-        .execute(pool)
+    // Verify WAL mode is active (set via SqliteConnectOptions)
+    let wal_mode: (String,) = sqlx::query_as("PRAGMA journal_mode")
+        .fetch_one(pool)
         .await?;
 
-    // Synchronous NORMAL is safe with WAL and much faster than FULL
-    sqlx::query("PRAGMA synchronous = NORMAL")
-        .execute(pool)
-        .await?;
+    if wal_mode.0.to_lowercase() != "wal" {
+        tracing::warn!("Expected WAL journal mode, got: {}", wal_mode.0);
+    }
 
-    // Cache size: -32000 = 32MB (negative = KB)
-    sqlx::query("PRAGMA cache_size = -32000")
-        .execute(pool)
-        .await?;
+    // Log current configuration for debugging
+    let cache_size: (i64,) = sqlx::query_as("PRAGMA cache_size").fetch_one(pool).await?;
+    let mmap_size: (i64,) = sqlx::query_as("PRAGMA mmap_size").fetch_one(pool).await?;
 
-    // Memory-mapped I/O: 64MB (reduced from 256MB for lower memory footprint)
-    sqlx::query("PRAGMA mmap_size = 67108864")
-        .execute(pool)
-        .await?;
-
-    // Store temp tables in memory
-    sqlx::query("PRAGMA temp_store = MEMORY")
-        .execute(pool)
-        .await?;
-
-    // Enable foreign keys
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(pool)
-        .await?;
-
-    // Busy timeout to handle concurrent access (5 seconds)
-    sqlx::query("PRAGMA busy_timeout = 5000")
-        .execute(pool)
-        .await?;
-
-    tracing::info!("SQLite configured: WAL mode, 32MB cache, 64MB mmap");
+    tracing::debug!(
+        "SQLite connection config: journal={}, cache_size={}, mmap_size={}",
+        wal_mode.0,
+        cache_size.0,
+        mmap_size.0
+    );
 
     Ok(())
 }
@@ -61,7 +49,9 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             device_id TEXT NOT NULL,
             device_name TEXT NOT NULL,
             client TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_activity TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS libraries (
@@ -393,6 +383,9 @@ async fn create_indexes(pool: &SqlitePool) -> Result<()> {
 
         // Find sessions by user
         "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
+
+        // Session expiration cleanup
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at) WHERE expires_at IS NOT NULL",
 
         // =========================================
         // Genre/Studio relationship indexes

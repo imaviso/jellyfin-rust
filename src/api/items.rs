@@ -801,64 +801,14 @@ async fn get_items(
     let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).min(1000);
 
-    // Build the SQL query based on parameters
-    let mut sql = String::from("SELECT * FROM media_items WHERE 1=1");
-    let mut count_sql = String::from("SELECT COUNT(*) as count FROM media_items WHERE 1=1");
+    // Parse item types once for reuse
+    let include_types: Option<Vec<&str>> = query
+        .include_item_types
+        .as_ref()
+        .map(|t| t.split(',').map(|s| s.trim()).collect());
 
-    // Filter by parent
-    if let Some(ref parent_id) = query.parent_id {
-        let filter = format!(" AND parent_id = '{}'", parent_id.replace('\'', "''"));
-        sql.push_str(&filter);
-        count_sql.push_str(&filter);
-    } else if !query.recursive.unwrap_or(false) {
-        // If no parent and not recursive, show top-level items (series/movies)
-        let filter = " AND parent_id IS NULL";
-        sql.push_str(filter);
-        count_sql.push_str(filter);
-    }
-
-    // Filter by item types
-    if let Some(ref types) = query.include_item_types {
-        let types_list: Vec<&str> = types.split(',').collect();
-        let placeholders: Vec<String> = types_list
-            .iter()
-            .map(|t| format!("'{}'", t.trim().replace('\'', "''")))
-            .collect();
-        let filter = format!(" AND item_type IN ({})", placeholders.join(","));
-        sql.push_str(&filter);
-        count_sql.push_str(&filter);
-    }
-
-    // Search term - case insensitive search across name and overview
-    if let Some(ref term) = query.search_term {
-        let escaped = term.replace('\'', "''").to_lowercase();
-        let filter = format!(
-            " AND (LOWER(name) LIKE '%{}%' OR LOWER(COALESCE(overview, '')) LIKE '%{}%')",
-            escaped, escaped
-        );
-        sql.push_str(&filter);
-        count_sql.push_str(&filter);
-    }
-
-    // Filter by favorites
-    if query.is_favorite == Some(true) {
-        let escaped_user_id = user_id.replace('\'', "''");
-        let filter = format!(
-            " AND id IN (SELECT item_id FROM user_favorites WHERE user_id = '{}')",
-            escaped_user_id
-        );
-        sql.push_str(&filter);
-        count_sql.push_str(&filter);
-    }
-
-    // Sort
+    // Determine sort column (whitelist to prevent injection)
     let sort_by = query.sort_by.as_deref().unwrap_or("SortName");
-    let sort_order = if query.sort_order.as_deref() == Some("Descending") {
-        "DESC"
-    } else {
-        "ASC"
-    };
-
     let order_col = match sort_by {
         "DateCreated" => "created_at",
         "PremiereDate" => "premiere_date",
@@ -867,19 +817,107 @@ async fn get_items(
         "Name" => "name",
         _ => "sort_name",
     };
+    let sort_order = if query.sort_order.as_deref() == Some("Descending") {
+        "DESC"
+    } else {
+        "ASC"
+    };
 
-    sql.push_str(&format!(
-        " ORDER BY {} {} LIMIT {} OFFSET {}",
-        order_col, sort_order, limit, start_index
-    ));
+    // Build main query using QueryBuilder for safe parameter binding
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+        sqlx::QueryBuilder::new("SELECT * FROM media_items WHERE 1=1");
 
-    // Execute queries
-    let items: Vec<MediaItem> = sqlx::query_as(&sql)
+    // Filter by parent
+    if let Some(ref parent_id) = query.parent_id {
+        qb.push(" AND parent_id = ").push_bind(parent_id.clone());
+    } else if !query.recursive.unwrap_or(false) {
+        qb.push(" AND parent_id IS NULL");
+    }
+
+    // Filter by item types using tuple binding
+    if let Some(ref types) = include_types {
+        qb.push(" AND item_type IN (");
+        let mut separated = qb.separated(", ");
+        for t in types {
+            separated.push_bind(t.to_string());
+        }
+        separated.push_unseparated(")");
+    }
+
+    // Search term - case insensitive search
+    if let Some(ref term) = query.search_term {
+        let search_pattern = format!("%{}%", term.to_lowercase());
+        qb.push(" AND (LOWER(name) LIKE ")
+            .push_bind(search_pattern.clone())
+            .push(" OR LOWER(COALESCE(overview, '')) LIKE ")
+            .push_bind(search_pattern)
+            .push(")");
+    }
+
+    // Filter by favorites using subquery with bound parameter
+    if query.is_favorite == Some(true) {
+        qb.push(" AND id IN (SELECT item_id FROM user_favorites WHERE user_id = ")
+            .push_bind(user_id.to_string())
+            .push(")");
+    }
+
+    // Sort and pagination (column names are whitelisted, not user input)
+    qb.push(" ORDER BY ")
+        .push(order_col)
+        .push(" ")
+        .push(sort_order)
+        .push(" LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(start_index);
+
+    // Execute main query
+    let items: Vec<MediaItem> = qb
+        .build_query_as()
         .fetch_all(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let total: (i32,) = sqlx::query_as(&count_sql)
+    // Build count query with same filters
+    let mut count_qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+        sqlx::QueryBuilder::new("SELECT COUNT(*) FROM media_items WHERE 1=1");
+
+    if let Some(ref parent_id) = query.parent_id {
+        count_qb
+            .push(" AND parent_id = ")
+            .push_bind(parent_id.clone());
+    } else if !query.recursive.unwrap_or(false) {
+        count_qb.push(" AND parent_id IS NULL");
+    }
+
+    if let Some(ref types) = include_types {
+        count_qb.push(" AND item_type IN (");
+        let mut separated = count_qb.separated(", ");
+        for t in types {
+            separated.push_bind(t.to_string());
+        }
+        separated.push_unseparated(")");
+    }
+
+    if let Some(ref term) = query.search_term {
+        let search_pattern = format!("%{}%", term.to_lowercase());
+        count_qb
+            .push(" AND (LOWER(name) LIKE ")
+            .push_bind(search_pattern.clone())
+            .push(" OR LOWER(COALESCE(overview, '')) LIKE ")
+            .push_bind(search_pattern)
+            .push(")");
+    }
+
+    if query.is_favorite == Some(true) {
+        count_qb
+            .push(" AND id IN (SELECT item_id FROM user_favorites WHERE user_id = ")
+            .push_bind(user_id.to_string())
+            .push(")");
+    }
+
+    let total: (i32,) = count_qb
+        .build_query_as()
         .fetch_one(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1422,44 +1460,50 @@ async fn search_with_fts(
         return Ok(vec![]);
     }
 
-    // Build type filter
-    let mut type_filter = String::new();
-    if let Some(ref types) = query.include_item_types {
-        let types_list: Vec<String> = types
-            .split(',')
-            .map(|t| format!("'{}'", t.trim().replace('\'', "''")))
-            .collect();
-        type_filter = format!(" AND m.item_type IN ({})", types_list.join(","));
-    }
-    if let Some(ref types) = query.exclude_item_types {
-        let types_list: Vec<String> = types
-            .split(',')
-            .map(|t| format!("'{}'", t.trim().replace('\'', "''")))
-            .collect();
-        type_filter.push_str(&format!(
-            " AND m.item_type NOT IN ({})",
-            types_list.join(",")
-        ));
-    }
+    // Parse item type filters
+    let include_types: Option<Vec<&str>> = query
+        .include_item_types
+        .as_ref()
+        .map(|t| t.split(',').map(|s| s.trim()).collect());
+    let exclude_types: Option<Vec<&str>> = query
+        .exclude_item_types
+        .as_ref()
+        .map(|t| t.split(',').map(|s| s.trim()).collect());
 
-    let sql = format!(
-        r#"
-        SELECT m.*
+    // Build query with QueryBuilder for safe parameter binding
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+        r#"SELECT m.*
         FROM media_items m
         JOIN media_items_fts f ON m.rowid = f.rowid
-        WHERE media_items_fts MATCH ?
-        {}
-        ORDER BY bm25(media_items_fts)
-        LIMIT ?
-        "#,
-        type_filter
+        WHERE media_items_fts MATCH "#,
     );
 
-    sqlx::query_as(&sql)
-        .bind(&fts_query)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+    qb.push_bind(fts_query);
+
+    // Include type filter
+    if let Some(ref types) = include_types {
+        qb.push(" AND m.item_type IN (");
+        let mut separated = qb.separated(", ");
+        for t in types {
+            separated.push_bind(t.to_string());
+        }
+        separated.push_unseparated(")");
+    }
+
+    // Exclude type filter
+    if let Some(ref types) = exclude_types {
+        qb.push(" AND m.item_type NOT IN (");
+        let mut separated = qb.separated(", ");
+        for t in types {
+            separated.push_bind(t.to_string());
+        }
+        separated.push_unseparated(")");
+    }
+
+    qb.push(" ORDER BY bm25(media_items_fts) LIMIT ")
+        .push_bind(limit);
+
+    qb.build_query_as().fetch_all(pool).await
 }
 
 /// Fallback search using LIKE (slower but always works)
@@ -1469,41 +1513,58 @@ async fn search_with_like(
     query: &SearchHintsQuery,
     limit: i32,
 ) -> Result<Vec<MediaItem>, (StatusCode, String)> {
-    let escaped = search_term.replace('\'', "''").to_lowercase();
+    let search_lower = search_term.to_lowercase();
+    let search_pattern = format!("%{}%", search_lower);
+    let prefix_pattern = format!("{}%", search_lower);
 
-    let mut sql = String::from(
-        "SELECT * FROM media_items WHERE (LOWER(name) LIKE '%' || ? || '%' OR LOWER(COALESCE(overview, '')) LIKE '%' || ? || '%')",
-    );
+    // Parse item type filters
+    let include_types: Option<Vec<&str>> = query
+        .include_item_types
+        .as_ref()
+        .map(|t| t.split(',').map(|s| s.trim()).collect());
+    let exclude_types: Option<Vec<&str>> = query
+        .exclude_item_types
+        .as_ref()
+        .map(|t| t.split(',').map(|s| s.trim()).collect());
 
-    // Filter by item types if specified
-    if let Some(ref types) = query.include_item_types {
-        let types_list: Vec<String> = types
-            .split(',')
-            .map(|t| format!("'{}'", t.trim().replace('\'', "''")))
-            .collect();
-        sql.push_str(&format!(" AND item_type IN ({})", types_list.join(",")));
+    // Build query with QueryBuilder
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+        sqlx::QueryBuilder::new("SELECT * FROM media_items WHERE (LOWER(name) LIKE ");
+
+    qb.push_bind(search_pattern.clone())
+        .push(" OR LOWER(COALESCE(overview, '')) LIKE ")
+        .push_bind(search_pattern)
+        .push(")");
+
+    // Include type filter
+    if let Some(ref types) = include_types {
+        qb.push(" AND item_type IN (");
+        let mut separated = qb.separated(", ");
+        for t in types {
+            separated.push_bind(t.to_string());
+        }
+        separated.push_unseparated(")");
     }
 
-    // Exclude item types if specified
-    if let Some(ref types) = query.exclude_item_types {
-        let types_list: Vec<String> = types
-            .split(',')
-            .map(|t| format!("'{}'", t.trim().replace('\'', "''")))
-            .collect();
-        sql.push_str(&format!(" AND item_type NOT IN ({})", types_list.join(",")));
+    // Exclude type filter
+    if let Some(ref types) = exclude_types {
+        qb.push(" AND item_type NOT IN (");
+        let mut separated = qb.separated(", ");
+        for t in types {
+            separated.push_bind(t.to_string());
+        }
+        separated.push_unseparated(")");
     }
 
     // Order by relevance: exact matches first, then prefix matches, then contains
-    sql.push_str(
-        " ORDER BY CASE WHEN LOWER(name) = ? THEN 0 WHEN LOWER(name) LIKE ? || '%' THEN 1 ELSE 2 END, name",
-    );
-    sql.push_str(&format!(" LIMIT {}", limit));
+    qb.push(" ORDER BY CASE WHEN LOWER(name) = ")
+        .push_bind(search_lower.clone())
+        .push(" THEN 0 WHEN LOWER(name) LIKE ")
+        .push_bind(prefix_pattern)
+        .push(" THEN 1 ELSE 2 END, name LIMIT ")
+        .push_bind(limit);
 
-    sqlx::query_as(&sql)
-        .bind(&escaped)
-        .bind(&escaped)
-        .bind(&escaped)
-        .bind(&escaped)
+    qb.build_query_as()
         .fetch_all(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

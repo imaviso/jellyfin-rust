@@ -1,6 +1,8 @@
 use anyhow::Result;
+use futures::{stream, StreamExt};
 use regex::Regex;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tokio::fs;
@@ -13,9 +15,168 @@ use crate::api::filters::{
 use crate::services::mediainfo;
 use crate::services::metadata::{MetadataService, UnifiedMetadata};
 
-pub const VIDEO_EXTENSIONS: &[&str] = &[
-    "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts",
+/// Concurrency limit for parallel operations (metadata fetch, ffprobe, etc.)
+const SCAN_CONCURRENCY: usize = 4;
+
+/// Batch size for database inserts
+const DB_BATCH_SIZE: usize = 50;
+
+/// Information about a discovered video file for batch processing
+#[derive(Debug, Clone)]
+struct DiscoveredEpisode {
+    path: PathBuf,
+    parsed: ParsedEpisode,
+}
+
+/// Information about a discovered movie file for batch processing
+#[derive(Debug, Clone)]
+struct DiscoveredMovie {
+    path: PathBuf,
+    parsed: ParsedMovie,
+}
+
+/// Collected media info for an episode (after parallel ffprobe)
+#[derive(Debug)]
+struct EpisodeMediaInfo {
+    path: PathBuf,
+    parsed: ParsedEpisode,
+    runtime_ticks: Option<i64>,
+}
+
+/// Collected media info for a movie (after parallel ffprobe)
+#[derive(Debug)]
+struct MovieMediaInfo {
+    path: PathBuf,
+    parsed: ParsedMovie,
+    runtime_ticks: Option<i64>,
+}
+
+/// Recursively collect all video files in a directory, with symlink loop protection
+async fn collect_video_files(path: &Path, visited: &mut HashSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+
+    // Canonicalize path to detect symlink loops
+    let canonical = match tokio::fs::canonicalize(path).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Cannot canonicalize path {:?}: {}", path, e);
+            return Ok(files);
+        }
+    };
+
+    // Check for symlink loop
+    if !visited.insert(canonical.clone()) {
+        tracing::warn!("Symlink loop detected, skipping: {:?}", path);
+        return Ok(files);
+    }
+
+    let mut entries = match fs::read_dir(path).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("Cannot read directory {:?}: {}", path, e);
+            return Ok(files);
+        }
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let entry_path = entry.path();
+
+        if entry_path.is_file() && is_video_file(&entry_path) {
+            files.push(entry_path);
+        } else if entry_path.is_dir() {
+            let folder_name = entry_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+
+            // Skip special folders
+            if should_skip_folder(folder_name) {
+                continue;
+            }
+
+            // Check for .ignore file
+            if should_ignore_path(&entry_path) {
+                continue;
+            }
+
+            // Recursively collect from subdirectory
+            let mut sub_files = Box::pin(collect_video_files(&entry_path, visited)).await?;
+            files.append(&mut sub_files);
+        }
+    }
+
+    Ok(files)
+}
+
+/// Extract media info for multiple files in parallel
+async fn parallel_extract_media_info(
+    files: Vec<(PathBuf, ParsedEpisode)>,
+) -> Vec<EpisodeMediaInfo> {
+    stream::iter(files)
+        .map(|(path, parsed)| async move {
+            let runtime_ticks = match mediainfo::extract_media_info_async(&path).await {
+                Ok(info) => info.duration_ticks,
+                Err(e) => {
+                    tracing::debug!("Failed to extract media info for {:?}: {}", path, e);
+                    None
+                }
+            };
+            EpisodeMediaInfo {
+                path,
+                parsed,
+                runtime_ticks,
+            }
+        })
+        .buffer_unordered(SCAN_CONCURRENCY)
+        .collect()
+        .await
+}
+
+/// Extract media info for multiple movie files in parallel
+async fn parallel_extract_movie_info(files: Vec<(PathBuf, ParsedMovie)>) -> Vec<MovieMediaInfo> {
+    stream::iter(files)
+        .map(|(path, parsed)| async move {
+            let runtime_ticks = match mediainfo::extract_media_info_async(&path).await {
+                Ok(info) => info.duration_ticks,
+                Err(e) => {
+                    tracing::debug!("Failed to extract media info for {:?}: {}", path, e);
+                    None
+                }
+            };
+            MovieMediaInfo {
+                path,
+                parsed,
+                runtime_ticks,
+            }
+        })
+        .buffer_unordered(SCAN_CONCURRENCY)
+        .collect()
+        .await
+}
+
+/// Default video extensions (used when config is not available)
+pub const DEFAULT_VIDEO_EXTENSIONS: &[&str] = &[
+    "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "m2ts", "mts",
+    "vob", "ogm", "ogv", "divx", "xvid", "rmvb", "rm", "asf", "3gp", "3g2", "f4v",
 ];
+
+/// Thread-local storage for configured video extensions
+/// This allows the scanner to use custom extensions without passing them through every function
+use std::sync::OnceLock;
+static CONFIGURED_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Set the video extensions to use for scanning
+pub fn set_video_extensions(extensions: Vec<String>) {
+    let _ = CONFIGURED_EXTENSIONS.set(extensions);
+}
+
+/// Get the configured video extensions, or fall back to defaults
+fn get_video_extensions() -> &'static [String] {
+    CONFIGURED_EXTENSIONS
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
 static RE_SEASON_EP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[Ss](\d{1,2})[Ee](\d{1,3})").unwrap());
 static RE_ALT_EP: LazyLock<Regex> = LazyLock::new(|| {
@@ -44,10 +205,19 @@ static RE_MOVIE_YEAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+?)[\s\.\-]*[\(\[]?(\d{4})[\)\]]?\s*$").unwrap());
 
 pub fn is_video_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+    let ext = match path.extension().and_then(|ext| ext.to_str()) {
+        Some(e) => e.to_lowercase(),
+        None => return false,
+    };
+
+    // Check configured extensions first
+    let configured = get_video_extensions();
+    if !configured.is_empty() {
+        return configured.iter().any(|e| e == &ext);
+    }
+
+    // Fall back to defaults
+    DEFAULT_VIDEO_EXTENSIONS.contains(&ext.as_str())
 }
 
 #[derive(Debug, Clone)]
@@ -584,7 +754,13 @@ async fn scan_tv_library_with_cache(
     Ok(())
 }
 
-/// Scan a show folder for episodes, recursively handling season subfolders
+/// Scan a show folder for episodes with parallel media info extraction
+///
+/// This function:
+/// 1. Recursively collects all video files (with symlink loop protection)
+/// 2. Parses episode info from filenames
+/// 3. Extracts media info (ffprobe) in parallel
+/// 4. Inserts episodes into the database
 async fn scan_show_folder(
     pool: &SqlitePool,
     library_id: &str,
@@ -594,117 +770,281 @@ async fn scan_show_folder(
     result: &mut ScanResult,
     metadata_service: Option<&MetadataService>,
 ) -> Result<()> {
-    let mut entries = fs::read_dir(path).await?;
-    let mut items_processed = 0u32;
+    // Phase 1: Collect all video files recursively with symlink protection
+    let mut visited = HashSet::new();
+    let video_files = collect_video_files(path, &mut visited).await?;
 
-    while let Some(entry) = entries.next_entry().await? {
-        let entry_path = entry.path();
+    if video_files.is_empty() {
+        return Ok(());
+    }
 
-        if entry_path.is_file() && is_video_file(&entry_path) {
-            let filename = entry_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
+    tracing::debug!("Found {} video files in {:?}", video_files.len(), path);
 
-            if let Some(parsed) = parse_episode_filename(filename) {
-                create_episode(
-                    pool,
-                    library_id,
-                    series_id,
-                    &parsed,
-                    entry_path.to_str().unwrap_or_default(),
-                    series_metadata,
-                    metadata_service,
-                )
-                .await?;
-                result.episodes_added += 1;
+    // Phase 2: Parse episode info from filenames
+    let parseable_files: Vec<(PathBuf, ParsedEpisode)> = video_files
+        .into_iter()
+        .filter_map(|file_path| {
+            let filename = file_path.file_name()?.to_str()?;
+            let parsed = parse_episode_filename(filename)?;
+            Some((file_path, parsed))
+        })
+        .collect();
+
+    if parseable_files.is_empty() {
+        tracing::debug!("No parseable episodes found in {:?}", path);
+        return Ok(());
+    }
+
+    // Phase 3: Extract media info in parallel (ffprobe is the bottleneck)
+    let episodes_with_info = parallel_extract_media_info(parseable_files).await;
+
+    // Phase 4: Insert episodes into database
+    // We process in batches for better memory management, but each episode
+    // still needs individual metadata fetch (for episode-specific info)
+    for episode_info in episodes_with_info {
+        // Fetch episode metadata if available (e.g., from TMDB)
+        let (episode_name, overview, premiere_date, rating) =
+            if let Some(service) = metadata_service {
+                match service
+                    .get_episode_metadata(
+                        series_metadata,
+                        episode_info.parsed.season,
+                        episode_info.parsed.episode,
+                    )
+                    .await
+                {
+                    Ok(Some(ep_meta)) => {
+                        let name = ep_meta
+                            .name
+                            .unwrap_or_else(|| format!("Episode {}", episode_info.parsed.episode));
+                        (
+                            name,
+                            ep_meta.overview,
+                            ep_meta.premiere_date,
+                            ep_meta.community_rating,
+                        )
+                    }
+                    _ => (
+                        format!("Episode {}", episode_info.parsed.episode),
+                        None,
+                        None,
+                        None,
+                    ),
+                }
             } else {
-                tracing::debug!("Could not parse episode info from: {}", filename);
-            }
+                (
+                    format!("Episode {}", episode_info.parsed.episode),
+                    None,
+                    None,
+                    None,
+                )
+            };
 
-            // Yield periodically
-            items_processed += 1;
-            if items_processed.is_multiple_of(10) {
-                tokio::task::yield_now().await;
-            }
-        } else if entry_path.is_dir() {
-            let folder_name = entry_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
+        let id = Uuid::new_v4().to_string();
+        let file_path = episode_info.path.to_str().unwrap_or_default();
 
-            // Skip special folders within the show folder too
-            if should_skip_folder(folder_name) {
-                tracing::debug!("Skipping special subfolder: {}", folder_name);
-                continue;
-            }
+        sqlx::query(
+            r#"INSERT INTO media_items 
+               (id, library_id, parent_id, item_type, name, path, index_number, parent_index_number, runtime_ticks, overview, premiere_date, community_rating)
+               VALUES (?, ?, ?, 'Episode', ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&id)
+        .bind(library_id)
+        .bind(series_id)
+        .bind(&episode_name)
+        .bind(file_path)
+        .bind(episode_info.parsed.episode)
+        .bind(episode_info.parsed.season)
+        .bind(episode_info.runtime_ticks)
+        .bind(&overview)
+        .bind(&premiere_date)
+        .bind(rating)
+        .execute(pool)
+        .await?;
 
-            // This could be a Season folder or other organization
-            // Recursively scan it, all episodes belong to the same series
-            Box::pin(scan_show_folder(
-                pool,
-                library_id,
-                series_id,
-                series_metadata,
-                &entry_path,
-                result,
-                metadata_service,
-            ))
-            .await?;
+        // Queue thumbnail generation
+        if let Err(e) = crate::db::queue_thumbnail(pool, &id, file_path).await {
+            tracing::warn!("Failed to queue thumbnail for episode {}: {}", id, e);
         }
+
+        result.episodes_added += 1;
     }
 
     Ok(())
 }
 
+/// Scan a movie library with parallel media info extraction
+///
+/// This function:
+/// 1. Recursively collects all video files (with symlink loop protection)
+/// 2. Parses movie info from filenames
+/// 3. Extracts media info (ffprobe) in parallel
+/// 4. Fetches metadata and inserts movies into the database
 async fn scan_movie_library(
     pool: &SqlitePool,
     library_id: &str,
     path: &Path,
     result: &mut ScanResult,
-    metadata: Option<&MetadataService>,
+    metadata_service: Option<&MetadataService>,
 ) -> Result<()> {
-    let mut entries = fs::read_dir(path).await?;
+    // Phase 1: Collect all video files recursively with symlink protection
+    let mut visited = HashSet::new();
+    let video_files = collect_video_files(path, &mut visited).await?;
 
-    // Counter for periodic yielding
-    let mut items_processed = 0u32;
+    if video_files.is_empty() {
+        return Ok(());
+    }
 
-    while let Some(entry) = entries.next_entry().await? {
-        let entry_path = entry.path();
+    tracing::debug!(
+        "Found {} video files in movie library {:?}",
+        video_files.len(),
+        path
+    );
 
-        if entry_path.is_file() && is_video_file(&entry_path) {
-            let filename = entry_path
+    // Phase 2: Parse movie info from filenames
+    let parseable_files: Vec<(PathBuf, ParsedMovie)> = video_files
+        .into_iter()
+        .map(|file_path| {
+            let filename = file_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-
             let parsed = parse_movie_filename(filename);
-            create_movie(
-                pool,
-                library_id,
-                &parsed,
-                entry_path.to_str().unwrap_or_default(),
-                metadata,
-            )
-            .await?;
-            result.movies_added += 1;
+            (file_path, parsed)
+        })
+        .collect();
 
-            // Yield to the runtime periodically to avoid blocking other tasks
-            items_processed += 1;
-            if items_processed.is_multiple_of(10) {
-                tokio::task::yield_now().await;
+    // Phase 3: Extract media info in parallel
+    let movies_with_info = parallel_extract_movie_info(parseable_files).await;
+
+    // Phase 4: Fetch metadata and insert movies
+    for movie_info in movies_with_info {
+        let file_path = movie_info.path.to_str().unwrap_or_default();
+
+        // Fetch metadata from providers
+        let metadata = if let Some(service) = metadata_service {
+            match service
+                .get_movie_metadata(&movie_info.parsed.title, movie_info.parsed.year)
+                .await
+            {
+                Ok(Some(meta)) => {
+                    tracing::debug!(
+                        "Found metadata for movie: {} -> {}",
+                        movie_info.parsed.title,
+                        meta.name.as_deref().unwrap_or("Unknown")
+                    );
+                    Some(meta)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to fetch metadata for {}: {}",
+                        movie_info.parsed.title,
+                        e
+                    );
+                    None
+                }
             }
-        } else if entry_path.is_dir() {
-            // Recursively scan subdirectories
-            Box::pin(scan_movie_library(
-                pool,
-                library_id,
-                &entry_path,
-                result,
-                metadata,
-            ))
-            .await?;
+        } else {
+            None
+        };
+
+        let id = Uuid::new_v4().to_string();
+        let sort_name = movie_info.parsed.title.to_lowercase();
+
+        let (
+            final_name,
+            overview,
+            year,
+            premiere_date,
+            rating,
+            tmdb_id,
+            imdb_id,
+            anilist_id,
+            mal_id,
+        ) = if let Some(ref meta) = metadata {
+            (
+                meta.name.as_deref().unwrap_or(&movie_info.parsed.title),
+                meta.overview.as_deref(),
+                meta.year.or(movie_info.parsed.year),
+                meta.premiere_date.as_deref(),
+                meta.community_rating,
+                meta.tmdb_id.as_deref(),
+                meta.imdb_id.as_deref(),
+                meta.anilist_id.as_deref(),
+                meta.mal_id.as_deref(),
+            )
+        } else {
+            (
+                &movie_info.parsed.title as &str,
+                None,
+                movie_info.parsed.year,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        // Use runtime from ffprobe (parallel extraction) or fallback to metadata
+        let runtime_ticks = movie_info.runtime_ticks;
+
+        sqlx::query(
+            r#"INSERT INTO media_items 
+               (id, library_id, item_type, name, path, year, sort_name, runtime_ticks, overview, premiere_date, community_rating, tmdb_id, imdb_id, anilist_id, mal_id)
+               VALUES (?, ?, 'Movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&id)
+        .bind(library_id)
+        .bind(final_name)
+        .bind(file_path)
+        .bind(year)
+        .bind(&sort_name)
+        .bind(runtime_ticks)
+        .bind(overview)
+        .bind(premiere_date)
+        .bind(rating)
+        .bind(tmdb_id)
+        .bind(imdb_id)
+        .bind(anilist_id)
+        .bind(mal_id)
+        .execute(pool)
+        .await?;
+
+        // Queue images for background download
+        if let Some(ref meta) = metadata {
+            if let Some(ref url) = meta.poster_url {
+                let _ = crate::db::queue_image(pool, &id, "Primary", url).await;
+            }
+            if let Some(ref url) = meta.backdrop_url {
+                let _ = crate::db::queue_image(pool, &id, "Backdrop", url).await;
+            }
         }
+
+        // Queue thumbnail generation
+        if let Err(e) = crate::db::queue_thumbnail(pool, &id, file_path).await {
+            tracing::warn!("Failed to queue thumbnail for movie {}: {}", id, e);
+        }
+
+        // Save genres to normalized tables
+        if let Some(ref meta) = metadata {
+            if let Some(ref genres) = meta.genres {
+                for genre_name in genres {
+                    if let Ok(genre_id) = get_or_create_genre(pool, genre_name).await {
+                        let _ = link_item_genre(pool, &id, &genre_id).await;
+                    }
+                }
+            }
+            if let Some(ref studio_name) = meta.studio {
+                if let Ok(studio_id) = get_or_create_studio(pool, studio_name).await {
+                    let _ = link_item_studio(pool, &id, &studio_id).await;
+                }
+            }
+        }
+
+        result.movies_added += 1;
     }
 
     Ok(())
