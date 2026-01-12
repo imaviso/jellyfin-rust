@@ -511,7 +511,8 @@ const SKIP_FOLDER_NAMES: &[&str] = &[
     "extras",
     "extra",
     "bonus",
-    "specials",
+    // Note: "specials" is NOT skipped - it contains legitimate content (OVAs, movies)
+    // that should be scanned as Season 0 (S00)
     "behind the scenes",
     "deleted scenes",
     "interviews",
