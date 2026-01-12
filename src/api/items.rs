@@ -1,6 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
+    http::Uri,
     http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::get,
@@ -14,6 +15,41 @@ use tokio_util::io::ReaderStream;
 use crate::{models::MediaItem, services::auth, services::mediainfo, AppState};
 
 use super::playbackinfo::{MediaSourceInfo, MediaStreamInfo};
+
+fn parse_query_params(query: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut params: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for part in query.split('&') {
+        if let Some((key, value)) = part.split_once('=') {
+            let key = urlencoding::decode(key)
+                .unwrap_or_else(|_| key.into())
+                .to_string();
+            let value = urlencoding::decode(value)
+                .unwrap_or_else(|_| value.into())
+                .to_string();
+            params.entry(key).or_default().push(value);
+        }
+    }
+    params
+}
+
+fn get_param(params: &std::collections::HashMap<String, Vec<String>>, key: &str) -> Option<String> {
+    params.get(key).and_then(|v| v.first().cloned())
+}
+
+fn get_param_i32(
+    params: &std::collections::HashMap<String, Vec<String>>,
+    key: &str,
+) -> Option<i32> {
+    get_param(params, key).and_then(|v| v.parse().ok())
+}
+
+fn get_param_bool(
+    params: &std::collections::HashMap<String, Vec<String>>,
+    key: &str,
+) -> Option<bool> {
+    get_param(params, key).map(|v| v.eq_ignore_ascii_case("true"))
+}
 
 /// Build MediaSourceInfo for a media item (used for single item requests)
 /// This provides video/audio/subtitle stream info to clients like Fladder
@@ -371,10 +407,10 @@ async fn get_item_filters(
     // Get distinct genres
     let genres: Vec<(String,)> = if let Some(ref parent_id) = query.parent_id {
         sqlx::query_as(
-            "SELECT DISTINCT g.name FROM genres g 
-             INNER JOIN item_genres ig ON g.id = ig.genre_id 
-             INNER JOIN media_items m ON ig.item_id = m.id 
-             WHERE m.library_id = ? 
+            "SELECT DISTINCT g.name FROM genres g
+             INNER JOIN item_genres ig ON g.id = ig.genre_id
+             INNER JOIN media_items m ON ig.item_id = m.id
+             WHERE m.library_id = ?
              ORDER BY g.name",
         )
         .bind(parent_id)
@@ -391,8 +427,8 @@ async fn get_item_filters(
     // Get distinct years
     let years: Vec<(i32,)> = if let Some(ref parent_id) = query.parent_id {
         sqlx::query_as(
-            "SELECT DISTINCT year FROM media_items 
-             WHERE library_id = ? AND year IS NOT NULL 
+            "SELECT DISTINCT year FROM media_items
+             WHERE library_id = ? AND year IS NOT NULL
              ORDER BY year DESC",
         )
         .bind(parent_id)
@@ -427,10 +463,10 @@ async fn get_item_filters2(
     // Get genres with IDs
     let genres: Vec<(String, String)> = if let Some(ref parent_id) = query.parent_id {
         sqlx::query_as(
-            "SELECT DISTINCT g.name, g.id FROM genres g 
-             INNER JOIN item_genres ig ON g.id = ig.genre_id 
-             INNER JOIN media_items m ON ig.item_id = m.id 
-             WHERE m.library_id = ? 
+            "SELECT DISTINCT g.name, g.id FROM genres g
+             INNER JOIN item_genres ig ON g.id = ig.genre_id
+             INNER JOIN media_items m ON ig.item_id = m.id
+             WHERE m.library_id = ?
              ORDER BY g.name",
         )
         .bind(parent_id)
@@ -447,8 +483,8 @@ async fn get_item_filters2(
     // Get distinct years
     let years: Vec<(i32,)> = if let Some(ref parent_id) = query.parent_id {
         sqlx::query_as(
-            "SELECT DISTINCT year FROM media_items 
-             WHERE library_id = ? AND year IS NOT NULL 
+            "SELECT DISTINCT year FROM media_items
+             WHERE library_id = ? AND year IS NOT NULL
              ORDER BY year DESC",
         )
         .bind(parent_id)
@@ -591,21 +627,48 @@ async fn delete_item(
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "camelCase")]
 pub struct GetItemsQuery {
     pub parent_id: Option<String>,
-    pub include_item_types: Option<String>,
-    pub exclude_item_types: Option<String>,
+    pub include_item_types: Option<Vec<String>>,
+    pub exclude_item_types: Option<Vec<String>>,
     pub recursive: Option<bool>,
-    pub sort_by: Option<String>,
-    pub sort_order: Option<String>,
+    pub sort_by: Option<Vec<String>>,
+    pub sort_order: Option<Vec<String>>,
     pub start_index: Option<i32>,
     pub limit: Option<i32>,
-    pub fields: Option<String>,
+    pub fields: Option<Vec<String>>,
     pub user_id: Option<String>,
     pub search_term: Option<String>,
     pub is_favorite: Option<bool>,
-    pub filters: Option<String>,
+    pub filters: Option<Vec<String>>,
+    pub genres: Option<Vec<String>>,
+    pub genre_ids: Option<Vec<String>>,
+    pub media_types: Option<Vec<String>>,
+}
+
+impl GetItemsQuery {
+    fn from_uri(uri: &Uri) -> Self {
+        let params = parse_query_params(uri.query().unwrap_or(""));
+        Self {
+            parent_id: get_param(&params, "parentId"),
+            include_item_types: params.get("includeItemTypes").cloned(),
+            exclude_item_types: params.get("excludeItemTypes").cloned(),
+            recursive: get_param_bool(&params, "recursive"),
+            sort_by: params.get("sortBy").cloned(),
+            sort_order: params.get("sortOrder").cloned(),
+            start_index: get_param_i32(&params, "startIndex"),
+            limit: get_param_i32(&params, "limit"),
+            fields: params.get("fields").cloned(),
+            user_id: get_param(&params, "userId"),
+            search_term: get_param(&params, "searchTerm"),
+            is_favorite: get_param_bool(&params, "isFavorite"),
+            filters: params.get("filters").cloned(),
+            genres: params.get("genres").cloned(),
+            genre_ids: params.get("genreIds").cloned(),
+            media_types: params.get("mediaTypes").cloned(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1070,31 +1133,48 @@ fn media_item_to_dto(
 async fn get_items(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<GetItemsQuery>,
+    uri: Uri,
 ) -> Result<Json<ItemsResponse>, (StatusCode, String)> {
     let user = require_auth(&state, &headers).await?;
+    let query = GetItemsQuery::from_uri(&uri);
     let user_id = query.user_id.as_deref().unwrap_or(&user.id);
 
     let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).min(1000);
 
+    // Check filters for IsFavorite
+    let is_favorite = query.is_favorite.unwrap_or(false)
+        || query
+            .filters
+            .as_ref()
+            .map(|v| v.iter().any(|s| s.eq_ignore_ascii_case("IsFavorite")))
+            .unwrap_or(false);
+
     // Parse item types once for reuse
-    let include_types: Option<Vec<&str>> = query
-        .include_item_types
-        .as_ref()
-        .map(|t| t.split(',').map(|s| s.trim()).collect());
+    let include_types: Option<Vec<String>> = query.include_item_types.map(|vec| {
+        vec.iter()
+            .flat_map(|s| s.split(','))
+            .map(|s| s.trim().to_string())
+            .collect()
+    });
 
     // Determine sort column (whitelist to prevent injection)
-    let sort_by = query.sort_by.as_deref().unwrap_or("SortName");
+    let sort_by_vec = query.sort_by.unwrap_or_default();
+    let sort_by = sort_by_vec
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("SortName");
     let order_col = match sort_by {
         "DateCreated" => "created_at",
         "PremiereDate" => "premiere_date",
         "IndexNumber" => "index_number",
         "CommunityRating" => "community_rating",
         "Name" => "name",
+        "DateLastContentAdded" => "updated_at",
         _ => "sort_name",
     };
-    let sort_order = if query.sort_order.as_deref() == Some("Descending") {
+    let sort_order_vec = query.sort_order.unwrap_or_default();
+    let sort_order = if sort_order_vec.first().map(|s| s.as_str()) == Some("Descending") {
         "DESC"
     } else {
         "ASC"
@@ -1106,7 +1186,15 @@ async fn get_items(
 
     // Filter by parent
     if let Some(ref parent_id) = query.parent_id {
-        qb.push(" AND parent_id = ").push_bind(parent_id.clone());
+        if query.recursive.unwrap_or(false) {
+            qb.push(" AND (library_id = ")
+                .push_bind(parent_id.clone())
+                .push(" OR parent_id = ")
+                .push_bind(parent_id.clone())
+                .push(")");
+        } else {
+            qb.push(" AND parent_id = ").push_bind(parent_id.clone());
+        }
     } else if !query.recursive.unwrap_or(false) {
         qb.push(" AND parent_id IS NULL");
     }
@@ -1132,7 +1220,7 @@ async fn get_items(
     }
 
     // Filter by favorites using subquery with bound parameter
-    if query.is_favorite == Some(true) {
+    if is_favorite {
         qb.push(" AND id IN (SELECT item_id FROM user_favorites WHERE user_id = ")
             .push_bind(user_id.to_string())
             .push(")");
@@ -1160,9 +1248,18 @@ async fn get_items(
         sqlx::QueryBuilder::new("SELECT COUNT(*) FROM media_items WHERE 1=1");
 
     if let Some(ref parent_id) = query.parent_id {
-        count_qb
-            .push(" AND parent_id = ")
-            .push_bind(parent_id.clone());
+        if query.recursive.unwrap_or(false) {
+            count_qb
+                .push(" AND (library_id = ")
+                .push_bind(parent_id.clone())
+                .push(" OR parent_id = ")
+                .push_bind(parent_id.clone())
+                .push(")");
+        } else {
+            count_qb
+                .push(" AND parent_id = ")
+                .push_bind(parent_id.clone());
+        }
     } else if !query.recursive.unwrap_or(false) {
         count_qb.push(" AND parent_id IS NULL");
     }
@@ -1186,7 +1283,7 @@ async fn get_items(
             .push(")");
     }
 
-    if query.is_favorite == Some(true) {
+    if is_favorite {
         count_qb
             .push(" AND id IN (SELECT item_id FROM user_favorites WHERE user_id = ")
             .push_bind(user_id.to_string())
@@ -1283,7 +1380,7 @@ async fn get_item(
 
         // Count episodes in this season
         let episode_count: (i32,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM media_items 
+            "SELECT COUNT(*) FROM media_items
              WHERE parent_id = ? AND item_type = 'Episode' AND COALESCE(parent_index_number, 1) = ?",
         )
         .bind(series_id)
@@ -1528,11 +1625,11 @@ pub async fn get_user_items(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(_user_id): Path<String>,
-    Query(query): Query<GetItemsQuery>,
+    uri: Uri,
 ) -> Result<Json<ItemsResponse>, (StatusCode, String)> {
     // Delegate to regular get_items - user-specific data (playback progress)
     // would be merged in a full implementation
-    get_items(State(state), headers, Query(query)).await
+    get_items(State(state), headers, uri).await
 }
 
 pub async fn get_user_item(
@@ -2101,7 +2198,7 @@ async fn refresh_item_metadata(
                 // Update the series with new metadata
                 if replace_all {
                     sqlx::query(
-                        r#"UPDATE media_items SET 
+                        r#"UPDATE media_items SET
                            name = COALESCE(?, name),
                            overview = ?,
                            year = COALESCE(?, year),
@@ -2132,7 +2229,7 @@ async fn refresh_item_metadata(
                 } else {
                     // Only fill missing fields
                     sqlx::query(
-                        r#"UPDATE media_items SET 
+                        r#"UPDATE media_items SET
                            overview = COALESCE(overview, ?),
                            year = COALESCE(year, ?),
                            premiere_date = COALESCE(premiere_date, ?),
@@ -2248,7 +2345,7 @@ async fn refresh_item_metadata(
                 // Update the movie
                 if replace_all {
                     sqlx::query(
-                        r#"UPDATE media_items SET 
+                        r#"UPDATE media_items SET
                            name = COALESCE(?, name),
                            overview = ?,
                            year = COALESCE(?, year),
@@ -2270,7 +2367,7 @@ async fn refresh_item_metadata(
                     .await?;
                 } else {
                     sqlx::query(
-                        r#"UPDATE media_items SET 
+                        r#"UPDATE media_items SET
                            overview = COALESCE(overview, ?),
                            year = COALESCE(year, ?),
                            premiere_date = COALESCE(premiere_date, ?),
@@ -3341,7 +3438,7 @@ async fn apply_remote_search(
 
     // Update the item with new metadata
     sqlx::query(
-        r#"UPDATE media_items SET 
+        r#"UPDATE media_items SET
             name = COALESCE(?, name),
             overview = COALESCE(?, overview),
             year = COALESCE(?, year),

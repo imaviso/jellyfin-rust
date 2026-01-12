@@ -37,7 +37,7 @@ jobs:
 
           # macOS x86_64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15
             artifact: jellyfin-rust
             archive: jellyfin-rust-macos-x86_64.tar.gz
 

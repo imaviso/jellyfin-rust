@@ -28,7 +28,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "camelCase")]
 pub struct PersonsQuery {
     pub search_term: Option<String>,
     pub person_types: Option<String>,
