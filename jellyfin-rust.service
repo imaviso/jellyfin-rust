@@ -1,0 +1,47 @@
+[Unit]
+Description=Jellyfin-Rust Media Server
+Documentation=https://github.com/your-username/jellyfin-rust
+After=network.target
+
+[Service]
+Type=simple
+User=jellyfin
+Group=jellyfin
+
+# Paths - adjust as needed
+Environment="RUST_LOG=info"
+Environment="FFMPEG_PATH=/usr/bin/ffmpeg"
+Environment="FFPROBE_PATH=/usr/bin/ffprobe"
+# Environment="TMDB_API_KEY=your-api-key-here"
+# Environment="ENABLE_ANIME_DB=true"
+
+# Working directory
+WorkingDirectory=/opt/jellyfin-rust
+
+# Start the server
+ExecStart=/opt/jellyfin-rust/jellyfin-rust
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Allow read access to media directories
+ReadOnlyPaths=/
+ReadWritePaths=/home/jellyfin/.local/share/jellyfin-rust
+ReadWritePaths=/home/jellyfin/.cache/jellyfin-rust
+ReadWritePaths=/home/jellyfin/.config/jellyfin-rust
+
+# Allow read access to media (adjust paths as needed)
+# ReadOnlyPaths=/mnt/media
+
+[Install]
+WantedBy=multi-user.target

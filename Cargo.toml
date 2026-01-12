@@ -1,0 +1,45 @@
+[package]
+name = "jellyfin-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+urlencoding = "2"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Password hashing
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["std"] }
+
+# Regex for filename parsing
+regex = "1"
+
+# Async utilities for streaming
+tokio-util = { version = "0.7", features = ["io"] }
+
+# HTTP client (for metadata fetching) - using rustls for static compilation
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+# Config
+dotenvy = "0.15"
+dirs = "5"
+toml = "0.8"

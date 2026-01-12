@@ -1,0 +1,5 @@
+/target
+/cache
+*.db
+opencode.json
+*logs.txt

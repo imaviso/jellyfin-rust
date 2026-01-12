@@ -1,0 +1,117 @@
+# jellyfin-rust configuration file
+# 
+# Place this file at one of these locations:
+#   - Linux:   ~/.config/jellyfin-rust/config.toml
+#   - macOS:   ~/Library/Application Support/jellyfin-rust/config.toml
+#   - Windows: C:\Users\<user>\AppData\Roaming\jellyfin-rust\config.toml
+#
+# Or set JELLYFIN_RUST_CONFIG_DIR to a custom location.
+#
+# Environment variables always take precedence over config file values.
+# All sections and keys are optional - only specify what you want to change.
+
+# ------------------------------------------------------------------------------
+# Server settings
+# ------------------------------------------------------------------------------
+[server]
+# Port to listen on (default: 8096)
+# Env override: JELLYFIN_RUST_PORT
+port = 8096
+
+# Address to bind to (default: 0.0.0.0 = all interfaces)
+# Use 127.0.0.1 for localhost only
+# Env override: JELLYFIN_RUST_BIND_ADDRESS
+bind_address = "0.0.0.0"
+
+# ------------------------------------------------------------------------------
+# Metadata provider settings
+# ------------------------------------------------------------------------------
+[metadata]
+# TMDB API key for movie/TV metadata (optional)
+# Get a free key at: https://www.themoviedb.org/settings/api
+# Env override: TMDB_API_KEY
+# tmdb_api_key = "your_tmdb_api_key_here"
+
+# Enable anime-offline-database for cross-referencing AniList/AniDB/Kitsu IDs
+# Downloads a ~60MB database on first use, cached locally
+# Env override: ENABLE_ANIME_DB
+enable_anime_db = false
+
+# ------------------------------------------------------------------------------
+# Directory paths (overrides XDG defaults)
+# ------------------------------------------------------------------------------
+[paths]
+# Override data directory (contains jellyfin.db)
+# Default (Linux): ~/.local/share/jellyfin-rust
+# Env override: JELLYFIN_RUST_DATA_DIR
+# data_dir = "/path/to/data"
+
+# Override cache directory (contains images, anime-offline-database)
+# Default (Linux): ~/.cache/jellyfin-rust
+# Env override: JELLYFIN_RUST_CACHE_DIR
+# cache_dir = "/path/to/cache"
+
+# Override config directory (this file's location)
+# Default (Linux): ~/.config/jellyfin-rust
+# Env override: JELLYFIN_RUST_CONFIG_DIR
+# config_dir = "/path/to/config"
+
+# ------------------------------------------------------------------------------
+# External tools
+# ------------------------------------------------------------------------------
+[tools]
+# Path to ffmpeg binary (for future transcoding support)
+# Env override: FFMPEG_PATH
+# ffmpeg_path = "/usr/bin/ffmpeg"
+
+# Path to ffprobe binary (for media info extraction)
+# Env override: FFPROBE_PATH
+# ffprobe_path = "/usr/bin/ffprobe"
+
+# ------------------------------------------------------------------------------
+# Media libraries
+# ------------------------------------------------------------------------------
+# Define your media libraries here. Each library needs:
+#   - name: Display name for the library
+#   - path: Absolute path to the media folder
+#   - type: Either "tvshows" or "movies"
+#
+# Libraries defined here will be auto-created on startup if they don't exist.
+# A scan will be triggered for any newly created libraries.
+#
+# Example:
+# [[libraries]]
+# name = "Anime"
+# path = "/media/anime"
+# type = "tvshows"
+#
+# [[libraries]]
+# name = "Movies"
+# path = "/media/movies"
+# type = "movies"
+#
+# [[libraries]]
+# name = "TV Shows"
+# path = "/media/tv"
+# type = "tvshows"
+
+# ------------------------------------------------------------------------------
+# Scanner settings
+# ------------------------------------------------------------------------------
+[scanner]
+# Enable periodic background scanning (default: true)
+enabled = true
+
+# Quick scan interval in minutes (default: 15, 0 to disable)
+# Quick scans only look for new/removed files without re-fetching metadata
+# This is very fast and suitable for frequent checking
+quick_scan_interval_minutes = 15
+
+# Full scan interval in hours (default: 24, 0 to disable)
+# Full scans re-fetch metadata for all items (destructive - clears library first)
+# Set to 0 to only run full scans manually via the API
+full_scan_interval_hours = 24
+
+# Run a quick scan on startup after library initialization (default: false)
+# Useful if you frequently add files while the server is stopped
+scan_on_startup = false
