@@ -132,9 +132,29 @@ impl AnimeOfflineDatabase {
     pub async fn unload(&self) {
         let mut db = self.database.write().await;
         if db.is_some() {
+            // Drop the database entries
             *db = None;
-            self.title_index.write().await.clear();
+
+            // Replace the title index with an empty one to actually deallocate memory
+            // (clear() only sets length to 0, doesn't release capacity)
+            let mut index = self.title_index.write().await;
+            *index = std::collections::HashMap::new();
+            drop(index);
+
             tracing::info!("Anime offline database unloaded from memory");
+
+            // Try to return memory to the OS (Linux-specific)
+            #[cfg(target_os = "linux")]
+            {
+                // malloc_trim returns memory to the OS
+                extern "C" {
+                    fn malloc_trim(pad: usize) -> i32;
+                }
+                unsafe {
+                    malloc_trim(0);
+                }
+                tracing::debug!("Called malloc_trim to release memory to OS");
+            }
         }
     }
 
