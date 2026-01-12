@@ -137,40 +137,48 @@ pub struct SystemStorageDto {
     pub libraries: Vec<LibraryStorageDto>,
 }
 
-/// Get disk usage info for a path
-fn get_folder_storage(path: &std::path::Path) -> Option<FolderStorageDto> {
-    use std::process::Command;
+/// Get disk usage info for a path (async to avoid blocking)
+async fn get_folder_storage(path: &std::path::Path) -> Option<FolderStorageDto> {
+    let path = path.to_path_buf();
 
-    // Use df command to get disk usage
-    let output = Command::new("df")
-        .arg("-B1") // bytes
-        .arg(path)
-        .output()
-        .ok()?;
+    // Run blocking df command in spawn_blocking to avoid blocking async runtime
+    tokio::task::spawn_blocking(move || {
+        use std::process::Command;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-    if lines.len() < 2 {
-        return None;
-    }
+        // Use df command to get disk usage
+        let output = Command::new("df")
+            .arg("-B1") // bytes
+            .arg(&path)
+            .output()
+            .ok()?;
 
-    // Parse df output: Filesystem 1B-blocks Used Available Use% Mounted
-    let parts: Vec<&str> = lines[1].split_whitespace().collect();
-    if parts.len() < 4 {
-        return None;
-    }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        if lines.len() < 2 {
+            return None;
+        }
 
-    let total: i64 = parts[1].parse().unwrap_or(0);
-    let used: i64 = parts[2].parse().unwrap_or(0);
-    let available: i64 = parts[3].parse().unwrap_or(0);
+        // Parse df output: Filesystem 1B-blocks Used Available Use% Mounted
+        let parts: Vec<&str> = lines[1].split_whitespace().collect();
+        if parts.len() < 4 {
+            return None;
+        }
 
-    Some(FolderStorageDto {
-        path: path.to_string_lossy().to_string(),
-        free_space: available,
-        used_space: used,
-        storage_type: "Local".to_string(),
-        device_id: Some(parts[0].to_string()),
+        let _total: i64 = parts[1].parse().unwrap_or(0);
+        let used: i64 = parts[2].parse().unwrap_or(0);
+        let available: i64 = parts[3].parse().unwrap_or(0);
+
+        Some(FolderStorageDto {
+            path: path.to_string_lossy().to_string(),
+            free_space: available,
+            used_space: used,
+            storage_type: "Local".to_string(),
+            device_id: Some(parts[0].to_string()),
+        })
     })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// GET /System/Info/Storage - Get storage information
@@ -180,9 +188,9 @@ async fn get_storage_info(
 ) -> Result<Json<SystemStorageDto>, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    // Get storage info for data directory
-    let data_folder = get_folder_storage(&state.config.paths.data_dir);
-    let cache_folder = get_folder_storage(&state.config.paths.cache_dir);
+    // Get storage info for data directory (parallel async calls)
+    let data_folder = get_folder_storage(&state.config.paths.data_dir).await;
+    let cache_folder = get_folder_storage(&state.config.paths.cache_dir).await;
 
     // Get library storage info
     let libraries: Vec<crate::models::Library> = sqlx::query_as("SELECT * FROM libraries")
@@ -190,18 +198,19 @@ async fn get_storage_info(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let library_storage: Vec<LibraryStorageDto> = libraries
-        .iter()
-        .filter_map(|lib| {
-            let path = std::path::Path::new(&lib.path);
-            get_folder_storage(path).map(|storage| LibraryStorageDto {
+    // Collect storage info for libraries (async)
+    let mut library_storage = Vec::new();
+    for lib in &libraries {
+        let path = std::path::Path::new(&lib.path);
+        if let Some(storage) = get_folder_storage(path).await {
+            library_storage.push(LibraryStorageDto {
                 name: lib.name.clone(),
                 path: lib.path.clone(),
                 free_space: storage.free_space,
                 used_space: storage.used_space,
-            })
-        })
-        .collect();
+            });
+        }
+    }
 
     Ok(Json(SystemStorageDto {
         program_data_folder: data_folder,

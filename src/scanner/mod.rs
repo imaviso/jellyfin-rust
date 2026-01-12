@@ -95,7 +95,7 @@ async fn collect_video_files(path: &Path, visited: &mut HashSet<PathBuf>) -> Res
             }
 
             // Check for .ignore file
-            if should_ignore_path(&entry_path) {
+            if should_ignore_path(&entry_path).await {
                 continue;
             }
 
@@ -196,11 +196,19 @@ static RE_SEASON_INFO: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\s+S\d{1,2}(?:-S?\d{1,2})?(?:\s|$).*$").unwrap());
 static RE_FOLDER_RELEASE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\s*(1080p|720p|480p|2160p|4k|bluray|blu-ray|webrip|web-dl|hdtv|dvdrip|bdrip|x264|x265|h\.?264|h\.?265|hevc|avc|aac|opus|flac|dts|atmos|10bit|hdr|sdr|remux|proper|repack|multi|dual|dubbed|subbed|raw|nf|cr|amzn|dsnp|hmax|hulu).*$"
+        r"(?i)[\s\.](1080p|720p|480p|2160p|4k|bluray|blu-ray|webrip|web-dl|web|hdtv|dvdrip|bdrip|x264|x265|h\.?264|h\.?265|hevc|avc|aac|opus|flac|dts|atmos|10bit|10-bit|hdr|sdr|remux|proper|repack|multi|dual|dubbed|subbed|raw|nf|cr|amzn|dsnp|hmax|hulu|complete|batch).*$"
     ).unwrap()
 });
 static RE_GROUP_SUFFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s*-[A-Za-z0-9]+$").unwrap());
+/// Matches bracketed info like [BDRip], [1080p], [Dual Audio], etc.
+static RE_BRACKETED_INFO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s*\[[^\]]*\]\s*").unwrap());
+/// Matches parenthesized release info like (BD 720p), (1080p), (V2), etc.
+/// But NOT years like (2023) which are 4 digits only
+static RE_PAREN_RELEASE_INFO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\s*\((?:BD|DVD|BluRay|BDRip|WEB|HDTV|V\d+|\d{3,4}p)[^\)]*\)\s*").unwrap()
+});
 static RE_MOVIE_YEAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+?)[\s\.\-]*[\(\[]?(\d{4})[\)\]]?\s*$").unwrap());
 
@@ -346,6 +354,7 @@ pub async fn scan_library(
         library_type,
         PathBuf::from("cache"),
         None,
+        None,
     )
     .await
 }
@@ -358,14 +367,22 @@ pub async fn scan_library_with_cache_dir(
     library_type: &str,
     cache_dir: PathBuf,
     anime_db_enabled: Option<bool>,
+    fetch_episode_metadata: Option<bool>,
 ) -> Result<ScanResult> {
     let image_cache_dir = cache_dir.join("images");
     let metadata_service = MetadataService::from_env(image_cache_dir, anime_db_enabled);
+    let fetch_ep_meta = fetch_episode_metadata.unwrap_or(false);
 
     if metadata_service.has_tmdb() {
         tracing::info!("Metadata providers: AniList + TMDB");
     } else {
         tracing::info!("Metadata providers: AniList only (set TMDB_API_KEY for more coverage)");
+    }
+
+    if fetch_ep_meta {
+        tracing::info!("Episode metadata fetching: enabled");
+    } else {
+        tracing::debug!("Episode metadata fetching: disabled (reduces API calls)");
     }
 
     if metadata_service.has_anime_db() {
@@ -386,6 +403,7 @@ pub async fn scan_library_with_cache_dir(
         path,
         library_type,
         Some(&metadata_service),
+        fetch_ep_meta,
     )
     .await;
 
@@ -407,13 +425,15 @@ pub async fn scan_library_with_metadata(
     path: &str,
     library_type: &str,
     metadata: Option<&MetadataService>,
+    fetch_episode_metadata: bool,
 ) -> Result<ScanResult> {
     let mut result = ScanResult::default();
 
     tracing::info!("Scanning library '{}' at path: {}", library_id, path);
 
     let path = Path::new(path);
-    if !path.exists() {
+    // Use async check to avoid blocking
+    if !fs::try_exists(path).await.unwrap_or(false) {
         tracing::warn!("Library path does not exist: {:?}", path);
         return Ok(result);
     }
@@ -430,6 +450,7 @@ pub async fn scan_library_with_metadata(
                 &mut result,
                 metadata,
                 &series_cache,
+                fetch_episode_metadata,
             )
             .await?;
         }
@@ -504,6 +525,32 @@ const SKIP_FOLDER_NAMES: &[&str] = &[
     ".unwatched",
 ];
 
+/// Patterns that indicate a folder is for openings/endings/extras (suffix patterns)
+const SKIP_FOLDER_SUFFIXES: &[&str] = &[
+    " - nced",
+    " - ncop",
+    " - nc",
+    " - ending",
+    " - opening",
+    " - op",
+    " - ed",
+    " nced",
+    " ncop",
+    "-nced",
+    "-ncop",
+    "_nced",
+    "_ncop",
+    " creditless",
+    " textless",
+    " - ova",
+    " - special",
+    " - specials",
+    " - extra",
+    " - extras",
+    " battle stage",
+    " extra stage",
+];
+
 /// Check if a folder should be skipped (special folders like NCED, NCOP, etc.)
 fn should_skip_folder(folder_name: &str) -> bool {
     let name_lower = folder_name.to_lowercase();
@@ -513,11 +560,26 @@ fn should_skip_folder(folder_name: &str) -> bool {
         return true;
     }
 
+    // Check prefix patterns
     if name_lower.starts_with("ncop") || name_lower.starts_with("nced") {
         return true;
     }
 
+    // Check suffix patterns (e.g., "Bocchi the Rock! - NCED")
+    for suffix in SKIP_FOLDER_SUFFIXES {
+        if name_lower.ends_with(suffix) {
+            return true;
+        }
+    }
+
+    // Check contains patterns
     if name_lower.contains("creditless") || name_lower.contains("textless") {
+        return true;
+    }
+
+    // Skip folders that look like release groups with no actual show name
+    // e.g., just "[SubGroup]" or "1080p.x265"
+    if name_lower.starts_with('[') && !name_lower.contains(" - ") && name_lower.len() < 30 {
         return true;
     }
 
@@ -525,12 +587,16 @@ fn should_skip_folder(folder_name: &str) -> bool {
 }
 
 /// Check if a .ignore file exists in this directory or any parent directory
-fn should_ignore_path(path: &Path) -> bool {
+async fn should_ignore_path(path: &Path) -> bool {
     let mut current = path.to_path_buf();
 
     // Walk up the directory tree looking for .ignore file
     loop {
-        if current.join(".ignore").exists() {
+        // Use async check to avoid blocking
+        if fs::try_exists(current.join(".ignore"))
+            .await
+            .unwrap_or(false)
+        {
             return true;
         }
 
@@ -638,7 +704,8 @@ async fn scan_tv_library(
         by_path: std::collections::HashMap::new(),
         by_provider: std::collections::HashMap::new(),
     };
-    scan_tv_library_with_cache(pool, library_id, path, result, metadata, &cache).await
+    // Default to no episode metadata fetching for backward compatibility
+    scan_tv_library_with_cache(pool, library_id, path, result, metadata, &cache, false).await
 }
 
 async fn scan_tv_library_with_cache(
@@ -648,6 +715,7 @@ async fn scan_tv_library_with_cache(
     result: &mut ScanResult,
     metadata: Option<&MetadataService>,
     series_cache: &SeriesCache,
+    fetch_episode_metadata: bool,
 ) -> Result<()> {
     // For TV shows, we expect a structure like:
     // library_path/
@@ -673,7 +741,7 @@ async fn scan_tv_library_with_cache(
                 .unwrap_or_default();
 
             // Check for .ignore file (can skip entire subtrees)
-            if should_ignore_path(&entry_path) {
+            if should_ignore_path(&entry_path).await {
                 tracing::debug!("Skipping ignored folder: {}", folder_name);
                 continue;
             }
@@ -712,6 +780,7 @@ async fn scan_tv_library_with_cache(
                 &entry_path,
                 result,
                 metadata,
+                fetch_episode_metadata,
             )
             .await?;
         } else if entry_path.is_file() && is_video_file(&entry_path) {
@@ -744,6 +813,7 @@ async fn scan_tv_library_with_cache(
                     entry_path.to_str().unwrap_or_default(),
                     series_metadata.as_ref(),
                     metadata,
+                    fetch_episode_metadata,
                 )
                 .await?;
                 result.episodes_added += 1;
@@ -769,6 +839,7 @@ async fn scan_show_folder(
     path: &Path,
     result: &mut ScanResult,
     metadata_service: Option<&MetadataService>,
+    fetch_episode_metadata: bool,
 ) -> Result<()> {
     // Phase 1: Collect all video files recursively with symlink protection
     let mut visited = HashSet::new();
@@ -800,10 +871,10 @@ async fn scan_show_folder(
 
     // Phase 4: Insert episodes into database
     // We process in batches for better memory management, but each episode
-    // still needs individual metadata fetch (for episode-specific info)
+    // still needs individual metadata fetch (for episode-specific info) if enabled
     for episode_info in episodes_with_info {
-        // Fetch episode metadata if available (e.g., from TMDB)
-        let (episode_name, overview, premiere_date, rating) =
+        // Fetch episode metadata if available and enabled (e.g., from TMDB)
+        let (episode_name, overview, premiere_date, rating) = if fetch_episode_metadata {
             if let Some(service) = metadata_service {
                 match service
                     .get_episode_metadata(
@@ -838,10 +909,37 @@ async fn scan_show_folder(
                     None,
                     None,
                 )
-            };
+            }
+        } else {
+            (
+                format!("Episode {}", episode_info.parsed.episode),
+                None,
+                None,
+                None,
+            )
+        };
 
         let id = Uuid::new_v4().to_string();
         let file_path = episode_info.path.to_str().unwrap_or_default();
+
+        // Check if this episode already exists (by path) to avoid duplicates
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM media_items WHERE path = ?")
+                .bind(file_path)
+                .fetch_optional(pool)
+                .await?;
+
+        if let Some((existing_id,)) = existing {
+            // Episode exists, but make sure it has a thumbnail queued
+            if !crate::db::has_thumbnail(pool, &existing_id)
+                .await
+                .unwrap_or(true)
+            {
+                let _ = crate::db::queue_thumbnail(pool, &existing_id, file_path).await;
+            }
+            tracing::debug!("Skipping duplicate episode: {}", file_path);
+            continue;
+        }
 
         sqlx::query(
             r#"INSERT INTO media_items 
@@ -920,6 +1018,25 @@ async fn scan_movie_library(
     // Phase 4: Fetch metadata and insert movies
     for movie_info in movies_with_info {
         let file_path = movie_info.path.to_str().unwrap_or_default();
+
+        // Check if this movie already exists (by path) to avoid duplicates
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM media_items WHERE path = ?")
+                .bind(file_path)
+                .fetch_optional(pool)
+                .await?;
+
+        if let Some((existing_id,)) = existing {
+            // Movie exists, but make sure it has a thumbnail queued
+            if !crate::db::has_thumbnail(pool, &existing_id)
+                .await
+                .unwrap_or(true)
+            {
+                let _ = crate::db::queue_thumbnail(pool, &existing_id, file_path).await;
+            }
+            tracing::debug!("Skipping duplicate movie: {}", file_path);
+            continue;
+        }
 
         // Fetch metadata from providers
         let metadata = if let Some(service) = metadata_service {
@@ -1053,20 +1170,30 @@ async fn scan_movie_library(
 /// Clean a folder name by removing release group info and normalizing
 /// e.g., "Himouto.Umaru.chan.S01.1080p.BluRay.x265-smol" -> "Himouto Umaru-chan"
 fn clean_folder_name(name: &str) -> String {
-    // Replace dots with spaces
+    // Replace dots with spaces (before other processing)
     let name = name.replace('.', " ");
+
+    // Remove bracketed info FIRST like [BDRip], [1080p], [Dual Audio], etc.
+    // This must happen before release pattern matching to avoid matching inside brackets
+    let name = RE_BRACKETED_INFO.replace_all(&name, " ");
+
+    // Remove parenthesized release info like (BD 720p), (1080p), (V2) but NOT years
+    let name = RE_PAREN_RELEASE_INFO.replace_all(&name, " ");
 
     // Remove season info (S01, S02, S01-S03, etc.) and everything after
     let name = RE_SEASON_INFO.replace(&name, "");
 
-    // Remove common release group patterns
+    // Remove common release group patterns (e.g., "1080p.BluRay.x265")
     let name = RE_FOLDER_RELEASE.replace(&name, "");
 
-    // Remove trailing group tags like "-smol" or "-VARYG"
+    // Remove trailing group tags like "-smol" or "-VARYG" or "-EMBER"
     let name = RE_GROUP_SUFFIX.replace(&name, "");
 
+    // Remove trailing underscores and dashes
+    let name = name.trim_end_matches(|c| c == '-' || c == '_' || c == ' ');
+
     // Collapse multiple spaces
-    let name = RE_SPACE_COLLAPSE.replace_all(&name, " ");
+    let name = RE_SPACE_COLLAPSE.replace_all(name, " ");
 
     name.trim().to_string()
 }
@@ -1250,6 +1377,161 @@ async fn clear_unmatched_tracking(pool: &SqlitePool, series_id: &str) -> Result<
     Ok(())
 }
 
+/// Normalize a series name for comparison purposes
+/// This helps detect duplicates like "Blue Box" vs "Blue Box (2024)"
+fn normalize_series_name(name: &str) -> String {
+    let (clean_name, _year) = extract_year_from_name(name);
+
+    // Additional normalization:
+    // - lowercase
+    // - remove punctuation except hyphens
+    // - collapse whitespace
+    let normalized = clean_name
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+
+    RE_SPACE_COLLAPSE
+        .replace_all(&normalized, " ")
+        .trim()
+        .to_string()
+}
+
+/// Find an existing series by normalized name (for duplicate detection when no provider IDs match)
+async fn find_existing_series_by_name(
+    pool: &SqlitePool,
+    library_id: &str,
+    name: &str,
+) -> Result<Option<(String, Option<UnifiedMetadata>)>> {
+    let normalized = normalize_series_name(name);
+
+    // Get all series in this library with their names and provider IDs
+    let series: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        r#"SELECT id, name, anilist_id, tmdb_id, mal_id, anidb_id 
+           FROM media_items 
+           WHERE library_id = ? AND item_type = 'Series'
+           ORDER BY created_at ASC"#, // Prefer older entries
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+
+    for (id, existing_name, anilist_id, tmdb_id, mal_id, anidb_id) in series {
+        let existing_normalized = normalize_series_name(&existing_name);
+
+        // Check if normalized names match
+        if normalized == existing_normalized {
+            tracing::info!(
+                "Found existing series by normalized name match: '{}' -> '{}' ({})",
+                name,
+                existing_name,
+                id
+            );
+
+            // Reconstruct minimal metadata if we have provider IDs
+            let metadata = if anilist_id.is_some()
+                || tmdb_id.is_some()
+                || mal_id.is_some()
+                || anidb_id.is_some()
+            {
+                Some(UnifiedMetadata {
+                    anilist_id,
+                    tmdb_id,
+                    mal_id,
+                    anidb_id,
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
+
+            return Ok(Some((id, metadata)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Update an existing series with new metadata
+async fn update_series_metadata(
+    pool: &SqlitePool,
+    series_id: &str,
+    metadata: &UnifiedMetadata,
+) -> Result<()> {
+    // Build dynamic UPDATE query based on what's available
+    sqlx::query(
+        r#"UPDATE media_items SET
+            name = COALESCE(?, name),
+            overview = COALESCE(?, overview),
+            year = COALESCE(?, year),
+            premiere_date = COALESCE(?, premiere_date),
+            community_rating = COALESCE(?, community_rating),
+            anilist_id = COALESCE(?, anilist_id),
+            mal_id = COALESCE(?, mal_id),
+            anidb_id = COALESCE(?, anidb_id),
+            kitsu_id = COALESCE(?, kitsu_id),
+            tmdb_id = COALESCE(?, tmdb_id),
+            imdb_id = COALESCE(?, imdb_id),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?"#,
+    )
+    .bind(metadata.name.as_deref())
+    .bind(metadata.overview.as_deref())
+    .bind(metadata.year)
+    .bind(metadata.premiere_date.as_deref())
+    .bind(metadata.community_rating)
+    .bind(metadata.anilist_id.as_deref())
+    .bind(metadata.mal_id.as_deref())
+    .bind(metadata.anidb_id.as_deref())
+    .bind(metadata.kitsu_id.as_deref())
+    .bind(metadata.tmdb_id.as_deref())
+    .bind(metadata.imdb_id.as_deref())
+    .bind(series_id)
+    .execute(pool)
+    .await?;
+
+    // Queue images if available
+    if let Some(ref url) = metadata.poster_url {
+        let _ = crate::db::queue_image(pool, series_id, "Primary", url).await;
+    }
+    if let Some(ref url) = metadata.backdrop_url {
+        let _ = crate::db::queue_image(pool, series_id, "Backdrop", url).await;
+    }
+
+    // Update genres
+    if let Some(ref genres) = metadata.genres {
+        for genre_name in genres {
+            if let Ok(genre_id) = get_or_create_genre(pool, genre_name).await {
+                let _ = link_item_genre(pool, series_id, &genre_id).await;
+            }
+        }
+    }
+
+    // Update studio
+    if let Some(ref studio_name) = metadata.studio {
+        if let Ok(studio_id) = get_or_create_studio(pool, studio_name).await {
+            let _ = link_item_studio(pool, series_id, &studio_id).await;
+        }
+    }
+
+    tracing::debug!("Updated series {} with new metadata", series_id);
+    Ok(())
+}
+
 async fn create_or_get_series(
     pool: &SqlitePool,
     library_id: &str,
@@ -1349,8 +1631,54 @@ async fn create_or_get_series_with_cache(
                 existing_id,
                 name
             );
+            // Update the existing series with any new metadata we have
+            if let Err(e) = update_series_metadata(pool, &existing_id, meta).await {
+                tracing::warn!("Failed to update series metadata: {}", e);
+            }
             return Ok((existing_id, metadata, false));
         }
+    }
+
+    // If no provider ID match, check by normalized name to avoid duplicates
+    // This catches cases like "Blue Box" vs "Blue Box (2024)"
+    if let Ok(Some((existing_id, existing_meta))) =
+        find_existing_series_by_name(pool, library_id, name).await
+    {
+        tracing::info!(
+            "Reusing existing series {} for folder '{}' (matched by normalized name)",
+            existing_id,
+            name
+        );
+
+        // If we have NEW metadata that's better than existing, update the series
+        if let Some(ref new_meta) = metadata {
+            let should_update = match &existing_meta {
+                None => true, // No existing metadata, definitely update
+                Some(existing) => {
+                    // Update if new metadata has more info (e.g., has overview but existing doesn't)
+                    (new_meta.overview.is_some() && existing.overview.is_none())
+                        || (new_meta.poster_url.is_some() && existing.poster_url.is_none())
+                        || (new_meta.anilist_id.is_some() && existing.anilist_id.is_none())
+                        || (new_meta.mal_id.is_some() && existing.mal_id.is_none())
+                }
+            };
+
+            if should_update {
+                tracing::info!(
+                    "Updating series {} with new metadata from {:?}",
+                    existing_id,
+                    new_meta.provider
+                );
+                if let Err(e) = update_series_metadata(pool, &existing_id, new_meta).await {
+                    tracing::warn!("Failed to update series metadata: {}", e);
+                }
+                return Ok((existing_id, metadata, false));
+            }
+        }
+
+        // Use existing metadata if we didn't update
+        let final_metadata = existing_meta.or(metadata);
+        return Ok((existing_id, final_metadata, false));
     }
 
     let id = Uuid::new_v4().to_string();
@@ -1526,49 +1854,72 @@ async fn create_episode(
     file_path: &str,
     series_metadata: Option<&UnifiedMetadata>,
     metadata_service: Option<&MetadataService>,
+    fetch_episode_metadata: bool,
 ) -> Result<String> {
+    // Check if this episode already exists (by path) to avoid duplicates
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM media_items WHERE path = ?")
+        .bind(file_path)
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some((existing_id,)) = existing {
+        // Episode exists, but make sure it has a thumbnail queued
+        if !crate::db::has_thumbnail(pool, &existing_id)
+            .await
+            .unwrap_or(true)
+        {
+            let _ = crate::db::queue_thumbnail(pool, &existing_id, file_path).await;
+        }
+        tracing::debug!("Episode already exists, skipping: {}", file_path);
+        return Ok(existing_id);
+    }
+
     let id = Uuid::new_v4().to_string();
 
-    // Try to fetch episode metadata from TMDB if we have a TMDB ID for the series
-    let (episode_name, overview, premiere_date, rating) = if let Some(service) = metadata_service {
-        match service
-            .get_episode_metadata(series_metadata, parsed.season, parsed.episode)
-            .await
-        {
-            Ok(Some(ep_meta)) => {
-                let name = ep_meta
-                    .name
-                    .unwrap_or_else(|| format!("Episode {}", parsed.episode));
-                tracing::debug!(
-                    "Found episode metadata: S{:02}E{:02} - {}",
-                    parsed.season,
-                    parsed.episode,
-                    name
-                );
-                (
-                    name,
-                    ep_meta.overview,
-                    ep_meta.premiere_date,
-                    ep_meta.community_rating,
-                )
+    // Try to fetch episode metadata from TMDB if enabled and we have a TMDB ID for the series
+    let (episode_name, overview, premiere_date, rating) = if fetch_episode_metadata {
+        if let Some(service) = metadata_service {
+            match service
+                .get_episode_metadata(series_metadata, parsed.season, parsed.episode)
+                .await
+            {
+                Ok(Some(ep_meta)) => {
+                    let name = ep_meta
+                        .name
+                        .unwrap_or_else(|| format!("Episode {}", parsed.episode));
+                    tracing::debug!(
+                        "Found episode metadata: S{:02}E{:02} - {}",
+                        parsed.season,
+                        parsed.episode,
+                        name
+                    );
+                    (
+                        name,
+                        ep_meta.overview,
+                        ep_meta.premiere_date,
+                        ep_meta.community_rating,
+                    )
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        "No episode metadata found for S{:02}E{:02}",
+                        parsed.season,
+                        parsed.episode
+                    );
+                    (format!("Episode {}", parsed.episode), None, None, None)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch episode metadata for S{:02}E{:02}: {}",
+                        parsed.season,
+                        parsed.episode,
+                        e
+                    );
+                    (format!("Episode {}", parsed.episode), None, None, None)
+                }
             }
-            Ok(None) => {
-                tracing::debug!(
-                    "No episode metadata found for S{:02}E{:02}",
-                    parsed.season,
-                    parsed.episode
-                );
-                (format!("Episode {}", parsed.episode), None, None, None)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch episode metadata for S{:02}E{:02}: {}",
-                    parsed.season,
-                    parsed.episode,
-                    e
-                );
-                (format!("Episode {}", parsed.episode), None, None, None)
-            }
+        } else {
+            (format!("Episode {}", parsed.episode), None, None, None)
         }
     } else {
         (format!("Episode {}", parsed.episode), None, None, None)
@@ -1631,6 +1982,24 @@ async fn create_movie(
     file_path: &str,
     metadata_service: Option<&MetadataService>,
 ) -> Result<String> {
+    // Check if this movie already exists (by path) to avoid duplicates
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM media_items WHERE path = ?")
+        .bind(file_path)
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some((existing_id,)) = existing {
+        // Movie exists, but make sure it has a thumbnail queued
+        if !crate::db::has_thumbnail(pool, &existing_id)
+            .await
+            .unwrap_or(true)
+        {
+            let _ = crate::db::queue_thumbnail(pool, &existing_id, file_path).await;
+        }
+        tracing::debug!("Movie already exists, skipping: {}", file_path);
+        return Ok(existing_id);
+    }
+
     let id = Uuid::new_v4().to_string();
     let sort_name = parsed.title.to_lowercase();
 
@@ -1781,6 +2150,16 @@ async fn create_movie(
 
 /// Refresh all libraries
 pub async fn refresh_all_libraries(pool: &SqlitePool) -> Result<()> {
+    refresh_all_libraries_with_settings(pool, PathBuf::from("cache"), None, None).await
+}
+
+/// Refresh all libraries with explicit settings
+pub async fn refresh_all_libraries_with_settings(
+    pool: &SqlitePool,
+    cache_dir: PathBuf,
+    anime_db_enabled: Option<bool>,
+    fetch_episode_metadata: Option<bool>,
+) -> Result<()> {
     let libraries: Vec<(String, String, String)> =
         sqlx::query_as("SELECT id, path, library_type FROM libraries")
             .fetch_all(pool)
@@ -1793,7 +2172,16 @@ pub async fn refresh_all_libraries(pool: &SqlitePool) -> Result<()> {
             .execute(pool)
             .await?;
 
-        scan_library(pool, &library_id, &path, &library_type).await?;
+        scan_library_with_cache_dir(
+            pool,
+            &library_id,
+            &path,
+            &library_type,
+            cache_dir.clone(),
+            anime_db_enabled,
+            fetch_episode_metadata,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1854,9 +2242,9 @@ pub async fn quick_scan_library(
     let existing_path_set: std::collections::HashSet<String> =
         existing_paths.iter().map(|(_, p)| p.clone()).collect();
 
-    // Check for removed files
+    // Check for removed files (use async to avoid blocking)
     for (item_id, item_path) in &existing_paths {
-        if !Path::new(item_path).exists() {
+        if !fs::try_exists(Path::new(item_path)).await.unwrap_or(true) {
             tracing::info!("Removing missing file from database: {}", item_path);
             sqlx::query("DELETE FROM media_items WHERE id = ?")
                 .bind(item_id)
@@ -1870,15 +2258,16 @@ pub async fn quick_scan_library(
     let image_cache_dir = cache_dir.join("images");
     let metadata_service = MetadataService::from_env(image_cache_dir, None);
 
-    // Scan for new files
+    // Scan for new files (use async check to avoid blocking)
     let path = Path::new(path);
-    if !path.exists() {
+    if !fs::try_exists(path).await.unwrap_or(false) {
         tracing::warn!("Library path does not exist: {:?}", path);
         return Ok(result);
     }
 
     match library_type {
         "tvshows" | "tvshow" => {
+            // Quick scan skips episode metadata fetching for speed
             quick_scan_tv_library(
                 pool,
                 library_id,
@@ -1886,6 +2275,7 @@ pub async fn quick_scan_library(
                 &existing_path_set,
                 &mut result,
                 Some(&metadata_service),
+                false, // Skip episode metadata for quick scans
             )
             .await?;
         }
@@ -1927,6 +2317,7 @@ async fn quick_scan_tv_library(
     existing_paths: &std::collections::HashSet<String>,
     result: &mut QuickScanResult,
     metadata: Option<&MetadataService>,
+    fetch_episode_metadata: bool,
 ) -> Result<()> {
     let mut entries = fs::read_dir(path).await?;
 
@@ -1991,6 +2382,7 @@ async fn quick_scan_tv_library(
                     &path_str,
                     series_metadata.as_ref(),
                     metadata,
+                    fetch_episode_metadata,
                 )
                 .await?;
                 result.files_added += 1;
@@ -2010,6 +2402,7 @@ async fn quick_scan_tv_library(
                 existing_paths,
                 result,
                 metadata,
+                fetch_episode_metadata,
             ))
             .await?;
         }
@@ -2070,6 +2463,198 @@ async fn quick_scan_movie_library(
     }
 
     Ok(())
+}
+
+/// Result of scanning for missing metadata
+#[derive(Debug, Default)]
+pub struct MissingMetadataResult {
+    pub series_scanned: i32,
+    pub series_updated: i32,
+    pub movies_scanned: i32,
+    pub movies_updated: i32,
+}
+
+/// Scan library for items missing metadata and fetch only for those
+/// This is more efficient than a full library scan when most items already have metadata
+pub async fn scan_missing_metadata(
+    pool: &SqlitePool,
+    library_id: &str,
+    cache_dir: PathBuf,
+    anime_db_enabled: Option<bool>,
+) -> Result<MissingMetadataResult> {
+    let image_cache_dir = cache_dir.join("images");
+    let metadata_service = MetadataService::from_env(image_cache_dir, anime_db_enabled);
+
+    // Preload anime database if enabled
+    if metadata_service.has_anime_db() {
+        let _ = metadata_service.preload_anime_db().await;
+    }
+
+    let mut result = MissingMetadataResult::default();
+
+    // Find series missing metadata (no overview AND no poster image)
+    let missing_series: Vec<(String, String, Option<i32>)> = sqlx::query_as(
+        r#"
+        SELECT m.id, m.name, m.year
+        FROM media_items m
+        WHERE m.library_id = ?
+          AND m.item_type = 'Series'
+          AND (
+            m.overview IS NULL 
+            OR m.overview = ''
+            OR NOT EXISTS (
+                SELECT 1 FROM images i WHERE i.item_id = m.id AND i.image_type = 'Primary'
+            )
+          )
+        ORDER BY m.name
+        "#,
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+
+    tracing::info!(
+        "Found {} series missing metadata in library {}",
+        missing_series.len(),
+        library_id
+    );
+
+    // Process series
+    for (series_id, name, year) in missing_series {
+        result.series_scanned += 1;
+
+        // Detect if this looks like anime
+        let is_anime = MetadataService::is_likely_anime(&name);
+
+        let metadata_result = if is_anime {
+            metadata_service.get_anime_metadata(&name, year).await
+        } else {
+            metadata_service.get_series_metadata(&name, year).await
+        };
+
+        match metadata_result {
+            Ok(Some(meta)) => {
+                tracing::info!(
+                    "Found metadata for series '{}' via {:?}",
+                    name,
+                    meta.provider
+                );
+
+                if let Err(e) = update_series_metadata(pool, &series_id, &meta).await {
+                    tracing::warn!("Failed to update series '{}': {}", name, e);
+                } else {
+                    result.series_updated += 1;
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("No metadata found for series '{}'", name);
+            }
+            Err(e) => {
+                tracing::warn!("Error fetching metadata for series '{}': {}", name, e);
+            }
+        }
+    }
+
+    // Find movies missing metadata
+    let missing_movies: Vec<(String, String, Option<i32>)> = sqlx::query_as(
+        r#"
+        SELECT m.id, m.name, m.year
+        FROM media_items m
+        WHERE m.library_id = ?
+          AND m.item_type = 'Movie'
+          AND (
+            m.overview IS NULL 
+            OR m.overview = ''
+            OR NOT EXISTS (
+                SELECT 1 FROM images i WHERE i.item_id = m.id AND i.image_type = 'Primary'
+            )
+          )
+        ORDER BY m.name
+        "#,
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+
+    tracing::info!(
+        "Found {} movies missing metadata in library {}",
+        missing_movies.len(),
+        library_id
+    );
+
+    // Process movies
+    for (movie_id, name, year) in missing_movies {
+        result.movies_scanned += 1;
+
+        match metadata_service.get_movie_metadata(&name, year).await {
+            Ok(Some(meta)) => {
+                tracing::info!(
+                    "Found metadata for movie '{}' via {:?}",
+                    name,
+                    meta.provider
+                );
+
+                // Update movie metadata
+                sqlx::query(
+                    r#"UPDATE media_items SET
+                        name = COALESCE(?, name),
+                        overview = COALESCE(?, overview),
+                        year = COALESCE(?, year),
+                        premiere_date = COALESCE(?, premiere_date),
+                        community_rating = COALESCE(?, community_rating),
+                        tmdb_id = COALESCE(?, tmdb_id),
+                        imdb_id = COALESCE(?, imdb_id),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?"#,
+                )
+                .bind(meta.name.as_deref())
+                .bind(meta.overview.as_deref())
+                .bind(meta.year)
+                .bind(meta.premiere_date.as_deref())
+                .bind(meta.community_rating)
+                .bind(meta.tmdb_id.as_deref())
+                .bind(meta.imdb_id.as_deref())
+                .bind(&movie_id)
+                .execute(pool)
+                .await?;
+
+                // Queue images
+                if let Some(ref url) = meta.poster_url {
+                    let _ = crate::db::queue_image(pool, &movie_id, "Primary", url).await;
+                }
+                if let Some(ref url) = meta.backdrop_url {
+                    let _ = crate::db::queue_image(pool, &movie_id, "Backdrop", url).await;
+                }
+
+                // Update genres
+                if let Some(ref genres) = meta.genres {
+                    for genre_name in genres {
+                        if let Ok(genre_id) = get_or_create_genre(pool, genre_name).await {
+                            let _ = link_item_genre(pool, &movie_id, &genre_id).await;
+                        }
+                    }
+                }
+
+                result.movies_updated += 1;
+            }
+            Ok(None) => {
+                tracing::debug!("No metadata found for movie '{}'", name);
+            }
+            Err(e) => {
+                tracing::warn!("Error fetching metadata for movie '{}': {}", name, e);
+            }
+        }
+    }
+
+    tracing::info!(
+        "Missing metadata scan complete: {}/{} series updated, {}/{} movies updated",
+        result.series_updated,
+        result.series_scanned,
+        result.movies_updated,
+        result.movies_scanned
+    );
+
+    Ok(result)
 }
 
 /// Update media info for items missing runtime_ticks
@@ -2185,5 +2770,134 @@ mod tests {
             "Re ZERO Starting Life in Another World"
         );
         assert_eq!(clean_folder_name("Link Click (2021)"), "Link Click (2021)");
+
+        // Scene release with bracketed info
+        assert_eq!(
+            clean_folder_name("To Your Eternity S01 1080p Dual Audio BDRip 10 bits DD x265-EMBER"),
+            "To Your Eternity"
+        );
+        assert_eq!(
+            clean_folder_name("Shangri-La Frontier [BD 1080p x265 OPUS][DUAL][Anipakku]"),
+            "Shangri-La Frontier"
+        );
+        // "Complete" is a release keyword and gets removed along with bracketed info
+        assert_eq!(
+            clean_folder_name(
+                "Super Cub - Season 1 Complete [BDRip] [1080p Dual Audio (Eng + Jap)] [Eng Subs]"
+            ),
+            "Super Cub - Season 1"
+        );
+    }
+
+    #[test]
+    fn test_should_skip_folder() {
+        // Exact matches
+        assert!(should_skip_folder("NCED"));
+        assert!(should_skip_folder("ncop"));
+        assert!(should_skip_folder("Extras"));
+
+        // Prefix patterns
+        assert!(should_skip_folder("NCED01"));
+        assert!(should_skip_folder("ncop2"));
+
+        // Suffix patterns (new functionality)
+        assert!(should_skip_folder("Bocchi the Rock! - NCED"));
+        assert!(should_skip_folder("Super Cub - Nced"));
+        assert!(should_skip_folder("Grand Blue - Ending"));
+        assert!(should_skip_folder("Grand Blue - Opening"));
+        assert!(should_skip_folder("Initial D - Battle Stage"));
+        assert!(should_skip_folder("Initial D - Extra Stage"));
+
+        // Should NOT skip normal folders
+        assert!(!should_skip_folder("Blue Box"));
+        assert!(!should_skip_folder("Chainsaw Man"));
+        assert!(!should_skip_folder("My Happy Marriage (2023)"));
+    }
+
+    #[test]
+    fn test_normalize_series_name() {
+        // Year removal
+        assert_eq!(normalize_series_name("Blue Box (2024)"), "blue box");
+        assert_eq!(normalize_series_name("Blue Box"), "blue box");
+
+        // Punctuation normalization (colons become spaces, trailing dashes removed by clean)
+        assert_eq!(
+            normalize_series_name("Re:ZERO -Starting Life in Another World-"),
+            "re zero -starting life in another world"
+        );
+
+        // Scene release cleaning
+        assert_eq!(
+            normalize_series_name("Scissor.Seven.S01-S03.1080p.NF.WEB-DL.AAC2.0.H.264.MULTi-VARYG"),
+            "scissor seven"
+        );
+    }
+
+    #[test]
+    fn test_folder_name_parsing() {
+        // Test clean_folder_name and extract_year_from_name with real-world examples
+        let test_cases = vec![
+            // (input, expected_clean_name, expected_year)
+            ("[Beatrice-Raws] Josee to Tora to Sakana-tachi [BDRip 1920x804 HEVC DTSHD]", "Josee to Tora to Sakana-tachi", None),
+            ("[MTBB] Legend of the Galactic Heroes (BD 720p)", "Legend of the Galactic Heroes", None),
+            ("[Reaktor] BECK - Mongolian Chop Squad Complete [1080p][x265][10-bit][Dual-Audio]", "BECK - Mongolian Chop Squad", None),
+            ("A Wild Last Boss Appeared! (2025)", "A Wild Last Boss Appeared!", Some(2025)),
+            ("Blue Box (2024)", "Blue Box", Some(2024)),
+            ("BOCCHI THE ROCK! (2022)", "BOCCHI THE ROCK!", Some(2022)),
+            ("Scissor.Seven.S01-S03.1080p.NF.WEB-DL.AAC2.0.H.264.MULTi-VARYG", "Scissor Seven", None),
+            ("Scissor.Seven.S04.1080p.NF.WEB-DL.AAC2.0.H.264-VARYG", "Scissor Seven", None),
+            ("Scissor Seven (2018)", "Scissor Seven", Some(2018)),
+            ("Shangri-La Frontier [BD 1080p x265 OPUS][DUAL][Anipakku]", "Shangri-La Frontier", None),
+            ("Super Cub - Season 1 Complete [BDRip] [1080p Dual Audio (Eng + Jap)] [Eng Subs]", "Super Cub - Season 1", None),
+            ("Himouto.Umaru.chan.S01.1080p.BluRay.Opus2.0.x265-smol", "Himouto Umaru chan", None),
+            ("Himouto.Umaru.chan.S02.1080p.BluRay.Opus2.0.x265-smol", "Himouto Umaru chan", None),
+            ("Initial D - Complete (1080p) (V2)", "Initial D", None),
+            ("JoJo's Bizarre Adventure (2012)", "JoJo's Bizarre Adventure", Some(2012)),
+            ("Kimi no Koto ga Daidaidaidaidaisuki na 100-nin no Kanojo", "Kimi no Koto ga Daidaidaidaidaisuki na 100-nin no Kanojo", None),
+            ("Grand Blue", "Grand Blue", None),
+            ("To Your Eternity S01 1080p Dual Audio BDRip 10 bits DD x265-EMBER", "To Your Eternity", None),
+            ("Trapped.in.a.Dating.Sim.S01.1080p.Bluray.Dual-Audio.Opus.2.0.10Bit.x264-Headpatter", "Trapped in a Dating Sim", None),
+            ("Violet Evergarden (2018)", "Violet Evergarden", Some(2018)),
+            ("Re - ZERO, Starting Life in Another World (2016)", "Re - ZERO, Starting Life in Another World", Some(2016)),
+            ("Frieren - Beyond Journey's End (2023)", "Frieren - Beyond Journey's End", Some(2023)),
+            ("The Apothecary Diaries (2023)", "The Apothecary Diaries", Some(2023)),
+            ("Lycoris Recoil (2022)", "Lycoris Recoil", Some(2022)),
+            ("My Dress-Up Darling (2022)", "My Dress-Up Darling", Some(2022)),
+            ("Solo Leveling (2024)", "Solo Leveling", Some(2024)),
+            ("Overlord (2015)", "Overlord", Some(2015)),
+            ("Samurai Champloo (2004)", "Samurai Champloo", Some(2004)),
+            ("Link Click (2021)", "Link Click", Some(2021)),
+        ];
+
+        println!("\n{:=<100}", "");
+        println!("FOLDER NAME PARSING TEST RESULTS");
+        println!("{:=<100}\n", "");
+
+        for (input, expected_name, expected_year) in test_cases {
+            let (actual_name, actual_year) = extract_year_from_name(input);
+
+            println!("INPUT:    {}", input);
+            println!("EXPECTED: {} (year: {:?})", expected_name, expected_year);
+            println!("ACTUAL:   {} (year: {:?})", actual_name, actual_year);
+
+            let name_match = actual_name == expected_name;
+            let year_match = actual_year == expected_year;
+
+            if name_match && year_match {
+                println!("STATUS:   ✓ PASS");
+            } else {
+                println!("STATUS:   ✗ FAIL");
+                if !name_match {
+                    println!("          Name mismatch!");
+                }
+                if !year_match {
+                    println!("          Year mismatch!");
+                }
+            }
+            println!();
+
+            assert_eq!(actual_name, expected_name, "Name mismatch for: {}", input);
+            assert_eq!(actual_year, expected_year, "Year mismatch for: {}", input);
+        }
     }
 }

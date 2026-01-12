@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use super::anidb::{AniDBClient, AniDBMetadata};
 use super::anilist::{AniListClient, AnimeMetadata, CastMember};
 use super::anime_db::AnimeOfflineDatabase;
+use super::jikan::{JikanClient, JikanMetadata};
 use super::tmdb::{MediaMetadata, TmdbCastMember, TmdbClient};
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +37,7 @@ pub enum MetadataProvider {
     None,
     AniList,
     AniDB,
+    Jikan,
     Tmdb,
 }
 
@@ -45,6 +47,7 @@ impl std::fmt::Display for MetadataProvider {
             MetadataProvider::None => write!(f, "None"),
             MetadataProvider::AniList => write!(f, "AniList"),
             MetadataProvider::AniDB => write!(f, "AniDB"),
+            MetadataProvider::Jikan => write!(f, "Jikan/MAL"),
             MetadataProvider::Tmdb => write!(f, "TMDB"),
         }
     }
@@ -64,6 +67,7 @@ pub struct EpisodeMetadata {
 pub struct MetadataService {
     anilist: AniListClient,
     anidb: AniDBClient,
+    jikan: JikanClient,
     anime_db: AnimeOfflineDatabase,
     tmdb: Option<TmdbClient>,
     image_cache_dir: PathBuf,
@@ -80,6 +84,7 @@ impl MetadataService {
         Self {
             anilist: AniListClient::new(image_cache_dir.clone()),
             anidb: AniDBClient::new(image_cache_dir.clone()),
+            jikan: JikanClient::new(),
             anime_db: AnimeOfflineDatabase::new(cache_dir, anime_db_enabled),
             tmdb,
             image_cache_dir,
@@ -209,6 +214,25 @@ impl MetadataService {
                                     return Ok(Some(unified));
                                 }
                             }
+
+                            // Try Jikan (MAL) if we have a MAL ID
+                            if let Some(mal_id) = provider_ids.mal_id {
+                                if let Ok(Some(meta)) = self.jikan.get_anime_by_id(mal_id).await {
+                                    tracing::info!(
+                                        "Found anime on Jikan/MAL (via local DB): {} -> {}",
+                                        name,
+                                        meta.name.as_deref().unwrap_or("Unknown")
+                                    );
+                                    let mut unified = self.jikan_to_unified(meta);
+                                    unified.anilist_id =
+                                        provider_ids.anilist_id.map(|id| id.to_string());
+                                    unified.anidb_id =
+                                        provider_ids.anidb_id.map(|id| id.to_string());
+                                    unified.kitsu_id =
+                                        provider_ids.kitsu_id.map(|id| id.to_string());
+                                    return Ok(Some(unified));
+                                }
+                            }
                         }
                     }
                 }
@@ -257,6 +281,24 @@ impl MetadataService {
             }
             Err(e) => {
                 tracing::warn!("AniList search failed for {}: {}", name, e);
+            }
+        }
+
+        // Try Jikan (MAL) as fallback
+        match self.jikan.search_anime_best_match(name, year).await {
+            Ok(Some(meta)) => {
+                tracing::info!(
+                    "Found anime on Jikan/MAL: {} -> {}",
+                    name,
+                    meta.name.as_deref().unwrap_or("Unknown")
+                );
+                return Ok(Some(self.jikan_to_unified(meta)));
+            }
+            Ok(None) => {
+                tracing::debug!("No Jikan/MAL match for: {}", name);
+            }
+            Err(e) => {
+                tracing::warn!("Jikan search failed for {}: {}", name, e);
             }
         }
 
@@ -375,6 +417,25 @@ impl MetadataService {
                                     return Ok(Some(unified));
                                 }
                             }
+
+                            // Try Jikan (MAL) if we have a MAL ID
+                            if let Some(mal_id) = provider_ids.mal_id {
+                                if let Ok(Some(meta)) = self.jikan.get_anime_by_id(mal_id).await {
+                                    tracing::info!(
+                                        "Found series on Jikan/MAL (via local DB): {} -> {}",
+                                        name,
+                                        meta.name.as_deref().unwrap_or("Unknown")
+                                    );
+                                    let mut unified = self.jikan_to_unified(meta);
+                                    unified.anilist_id =
+                                        provider_ids.anilist_id.map(|id| id.to_string());
+                                    unified.anidb_id =
+                                        provider_ids.anidb_id.map(|id| id.to_string());
+                                    unified.kitsu_id =
+                                        provider_ids.kitsu_id.map(|id| id.to_string());
+                                    return Ok(Some(unified));
+                                }
+                            }
                         }
                     }
                 }
@@ -451,11 +512,29 @@ impl MetadataService {
             }
         }
 
+        // Try Jikan (MAL) as final fallback for anime
+        match self.jikan.search_anime_best_match(name, year).await {
+            Ok(Some(meta)) => {
+                tracing::info!(
+                    "Found series on Jikan/MAL: {} -> {}",
+                    name,
+                    meta.name.as_deref().unwrap_or("Unknown")
+                );
+                return Ok(Some(self.jikan_to_unified(meta)));
+            }
+            Ok(None) => {
+                tracing::debug!("No Jikan/MAL match for: {}", name);
+            }
+            Err(e) => {
+                tracing::warn!("Jikan search failed for {}: {}", name, e);
+            }
+        }
+
         Ok(None)
     }
 
     /// Get metadata for a movie
-    /// Only uses TMDB (anime movies are rare and usually on TMDB too)
+    /// Uses TMDB first, then Jikan/AniList for anime movies
     pub async fn get_movie_metadata(
         &self,
         title: &str,
@@ -479,6 +558,24 @@ impl MetadataService {
                 Err(e) => {
                     tracing::warn!("TMDB search failed for movie {}: {}", title, e);
                 }
+            }
+        }
+
+        // Try Jikan for anime movies
+        match self.jikan.search_anime_best_match(title, year).await {
+            Ok(Some(meta)) => {
+                tracing::info!(
+                    "Found movie on Jikan/MAL: {} -> {}",
+                    title,
+                    meta.name.as_deref().unwrap_or("Unknown")
+                );
+                return Ok(Some(self.jikan_to_unified(meta)));
+            }
+            Ok(None) => {
+                tracing::debug!("No Jikan/MAL match for movie: {}", title);
+            }
+            Err(e) => {
+                tracing::debug!("Jikan search failed for movie {}: {}", title, e);
             }
         }
 
@@ -746,6 +843,31 @@ impl MetadataService {
             studio: None,
             cast: Vec::new(),
             provider: MetadataProvider::AniDB,
+        }
+    }
+
+    fn jikan_to_unified(&self, meta: JikanMetadata) -> UnifiedMetadata {
+        UnifiedMetadata {
+            mal_id: meta.mal_id,
+            anilist_id: None,
+            anidb_id: None,
+            kitsu_id: None,
+            tmdb_id: None,
+            imdb_id: None,
+            name: meta.name,
+            name_original: meta.name_japanese.or(meta.name_english),
+            overview: meta.overview,
+            year: meta.year,
+            premiere_date: meta.premiere_date,
+            community_rating: meta.community_rating,
+            poster_url: meta.poster_url,
+            backdrop_url: meta.backdrop_url,
+            episode_count: meta.episode_count,
+            runtime_minutes: None,
+            genres: meta.genres,
+            studio: meta.studio,
+            cast: Vec::new(),
+            provider: MetadataProvider::Jikan,
         }
     }
 

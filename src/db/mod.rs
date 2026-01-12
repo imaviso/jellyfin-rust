@@ -595,11 +595,17 @@ pub struct PendingImage {
 }
 
 /// Queue a video file for thumbnail generation
+/// If already queued (even if failed), reset to pending for retry
 pub async fn queue_thumbnail(pool: &SqlitePool, item_id: &str, video_path: &str) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT OR IGNORE INTO thumbnail_queue (item_id, video_path, status)
-        VALUES (?, ?, 'pending')
+        INSERT INTO thumbnail_queue (item_id, video_path, status, attempts)
+        VALUES (?, ?, 'pending', 0)
+        ON CONFLICT(item_id) DO UPDATE SET
+            video_path = excluded.video_path,
+            status = 'pending',
+            attempts = 0
+        WHERE status = 'failed' OR status = 'pending'
         "#,
     )
     .bind(item_id)
@@ -607,6 +613,16 @@ pub async fn queue_thumbnail(pool: &SqlitePool, item_id: &str, video_path: &str)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Check if an item has a thumbnail image
+pub async fn has_thumbnail(pool: &SqlitePool, item_id: &str) -> Result<bool> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM images WHERE item_id = ? AND image_type = 'Primary' LIMIT 1")
+            .bind(item_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
 }
 
 /// Get pending thumbnails to generate
@@ -661,6 +677,50 @@ pub async fn get_pending_thumbnail_count(pool: &SqlitePool) -> Result<i64> {
             .fetch_one(pool)
             .await?;
     Ok(row.0)
+}
+
+/// Queue thumbnails for all episodes/movies that don't have a Primary image
+/// Returns the number of items queued
+pub async fn queue_missing_thumbnails(pool: &SqlitePool) -> Result<i64> {
+    // Find all episodes and movies that:
+    // 1. Have a file path (not series/virtual items)
+    // 2. Don't have a Primary image in the images table
+    // 3. Aren't already in the thumbnail queue
+    let result = sqlx::query(
+        r#"
+        INSERT INTO thumbnail_queue (item_id, video_path, status, attempts)
+        SELECT m.id, m.path, 'pending', 0
+        FROM media_items m
+        WHERE m.path IS NOT NULL
+          AND m.item_type IN ('Episode', 'Movie')
+          AND NOT EXISTS (
+              SELECT 1 FROM images i 
+              WHERE i.item_id = m.id AND i.image_type = 'Primary'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM thumbnail_queue t 
+              WHERE t.item_id = m.id AND t.status = 'pending'
+          )
+        ON CONFLICT(item_id) DO UPDATE SET
+            status = 'pending',
+            attempts = 0
+        WHERE thumbnail_queue.status = 'failed'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() as i64)
+}
+
+/// Reset all failed thumbnails to pending for retry
+pub async fn reset_failed_thumbnails(pool: &SqlitePool) -> Result<i64> {
+    let result = sqlx::query(
+        "UPDATE thumbnail_queue SET status = 'pending', attempts = 0 WHERE status = 'failed'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as i64)
 }
 
 #[derive(Debug, sqlx::FromRow)]

@@ -38,8 +38,9 @@ pub fn search_routes() -> Router<Arc<AppState>> {
             "/:item_id/RemoteSearch/Subtitles/:language",
             get(search_subtitles),
         )
+        // Download uses a different path to avoid conflict with search route
         .route(
-            "/:item_id/RemoteSearch/Subtitles/:subtitle_id",
+            "/:item_id/RemoteSearch/Subtitles/Download/:subtitle_id",
             post(download_subtitle),
         )
 }
@@ -163,7 +164,8 @@ async fn get_subtitle_inner(
         cache_dir.join(format!("{}.{}", index, &format))
     };
 
-    if cache_file.exists() {
+    // Check cache (use async to avoid blocking)
+    if tokio::fs::try_exists(&cache_file).await.unwrap_or(false) {
         tracing::debug!("Serving cached subtitle: {:?}", cache_file);
         return serve_subtitle_file(&cache_file, &format).await;
     }
@@ -378,8 +380,7 @@ async fn search_subtitles(
 
     // Try OpenSubtitles if API key is configured
     if let Ok(api_key) = std::env::var("OPENSUBTITLES_API_KEY") {
-        let search_results =
-            search_opensubtitles(&api_key, &item, &path.language).await;
+        let search_results = search_opensubtitles(&api_key, &item, &path.language).await;
         results.extend(search_results);
     }
 
@@ -503,10 +504,7 @@ async fn search_opensubtitles(
     };
 
     if !response.status().is_success() {
-        tracing::error!(
-            "OpenSubtitles returned status: {}",
-            response.status()
-        );
+        tracing::error!("OpenSubtitles returned status: {}", response.status());
         return vec![];
     }
 
@@ -584,9 +582,7 @@ async fn search_opensubtitles(
                     .get("upload_date")
                     .and_then(|d| d.as_str())
                     .map(|s| s.to_string()),
-                community_rating: attributes
-                    .get("ratings")
-                    .and_then(|r| r.as_f64()),
+                community_rating: attributes.get("ratings").and_then(|r| r.as_f64()),
                 download_count,
                 is_hash_match: Some(false),
                 is_forced: Some(false),
@@ -619,36 +615,54 @@ async fn download_opensubtitles_subtitle(
         }))
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Download request failed: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Download request failed: {}", e),
+            )
+        })?;
 
     if !download_response.status().is_success() {
         return Err((
             StatusCode::BAD_GATEWAY,
-            format!("OpenSubtitles download failed: {}", download_response.status()),
+            format!(
+                "OpenSubtitles download failed: {}",
+                download_response.status()
+            ),
         ));
     }
 
-    let download_json: serde_json::Value = download_response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to parse download response: {}", e)))?;
+    let download_json: serde_json::Value = download_response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to parse download response: {}", e),
+        )
+    })?;
 
     let download_link = download_json
         .get("link")
         .and_then(|l| l.as_str())
-        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "No download link in response".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "No download link in response".to_string(),
+            )
+        })?;
 
     // Download the actual subtitle file
-    let subtitle_response = client
-        .get(download_link)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Subtitle download failed: {}", e)))?;
+    let subtitle_response = client.get(download_link).send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Subtitle download failed: {}", e),
+        )
+    })?;
 
-    let subtitle_bytes = subtitle_response
-        .bytes()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to read subtitle data: {}", e)))?;
+    let subtitle_bytes = subtitle_response.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read subtitle data: {}", e),
+        )
+    })?;
 
     // Save the subtitle file
     let cache_dir = get_subtitle_cache_dir(&item.id);
@@ -656,11 +670,11 @@ async fn download_opensubtitles_subtitle(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Find the next available subtitle index
+    // Find the next available subtitle index (use async to avoid blocking)
     let mut index = 100; // Start external subtitles at index 100
     loop {
         let path = cache_dir.join(format!("{}.{}", index, format));
-        if !path.exists() {
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             break;
         }
         index += 1;
@@ -669,7 +683,12 @@ async fn download_opensubtitles_subtitle(
     let subtitle_path = cache_dir.join(format!("{}.{}", index, format));
     tokio::fs::write(&subtitle_path, &subtitle_bytes)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save subtitle: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save subtitle: {}", e),
+            )
+        })?;
 
     tracing::info!(
         "Downloaded subtitle for item {} to {:?}",

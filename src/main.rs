@@ -217,7 +217,8 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    if !lib.path.exists() {
+                    // Use async check to avoid blocking
+                    if !tokio::fs::try_exists(&lib.path).await.unwrap_or(false) {
                         tracing::warn!(
                             "Skipping library '{}': path does not exist: {}",
                             lib.name,
@@ -256,6 +257,7 @@ async fn main() -> Result<()> {
                         &lib_type,
                         bg_config.paths.cache_dir.clone(),
                         Some(bg_config.anime_db_enabled),
+                        Some(bg_config.fetch_episode_metadata),
                     )
                     .await
                     {
@@ -379,9 +381,11 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(10)).await;
 
             let image_cache_dir = image_config.paths.cache_dir.join("images");
+            // Disable anime_db for image downloader - it only needs to download from URLs,
+            // not search for metadata. This saves ~60MB of RAM.
             let metadata_service = services::metadata::MetadataService::from_env(
                 image_cache_dir.clone(),
-                Some(image_config.anime_db_enabled),
+                Some(false), // Don't load anime-offline-database for image downloads
             );
 
             tracing::info!("Background image downloader started");
@@ -515,6 +519,61 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // Spawn missing thumbnail checker task (configurable interval)
+    if config.scanner.missing_thumbnail_check_minutes > 0 {
+        let thumb_check_pool = pool.clone();
+        let thumb_check_config = config.clone();
+        let cancel = shutdown_token.clone();
+        let interval_secs = config.scanner.missing_thumbnail_check_minutes * 60;
+
+        bg_tasks.spawn("missing-thumbnail-checker", async move {
+            // Wait 2 minutes before first check (let initial scan complete)
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            tracing::info!(
+                "Missing thumbnail checker started (interval: {} minutes)",
+                thumb_check_config.scanner.missing_thumbnail_check_minutes
+            );
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        tracing::debug!("Missing thumbnail checker received shutdown signal");
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {
+                        // Queue any items missing thumbnails
+                        match db::queue_missing_thumbnails(&thumb_check_pool).await {
+                            Ok(count) if count > 0 => {
+                                tracing::info!("Queued {} missing thumbnails for generation", count);
+                            }
+                            Ok(_) => {
+                                tracing::debug!("No missing thumbnails found");
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to check for missing thumbnails: {}", e);
+                            }
+                        }
+
+                        // Also reset any failed thumbnails for retry (if enabled)
+                        if thumb_check_config.scanner.retry_failed_thumbnails {
+                            match db::reset_failed_thumbnails(&thumb_check_pool).await {
+                                Ok(count) if count > 0 => {
+                                    tracing::info!("Reset {} failed thumbnails for retry", count);
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!("Failed to reset failed thumbnails: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        tracing::info!("Missing thumbnail checker disabled (interval set to 0)");
     }
 
     // Root handler

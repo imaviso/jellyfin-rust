@@ -488,11 +488,12 @@ async fn create_user(
     }
 
     // Check if username already exists
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE LOWER(name) = LOWER(?)")
-        .bind(&req.name)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM users WHERE LOWER(name) = LOWER(?)")
+            .bind(&req.name)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if exists.is_some() {
         return Err((
@@ -504,8 +505,12 @@ async fn create_user(
     // Generate user ID and hash password
     let user_id = uuid::Uuid::new_v4().to_string();
     let password = req.password.unwrap_or_default();
-    let password_hash = auth::hash_password(&password)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to hash password: {}", e)))?;
+    let password_hash = auth::hash_password(&password).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to hash password: {}", e),
+        )
+    })?;
     let now = chrono::Utc::now().to_rfc3339();
 
     // Create the user

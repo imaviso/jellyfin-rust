@@ -192,7 +192,9 @@ impl AnimeOfflineDatabase {
         fs::create_dir_all(&self.cache_dir).await?;
         let db_path = self.cache_dir.join(DATABASE_FILENAME);
 
-        let should_download = if db_path.exists() {
+        // Use async check to avoid blocking
+        let db_exists = fs::try_exists(&db_path).await.unwrap_or(false);
+        let should_download = if db_exists {
             match fs::metadata(&db_path).await {
                 Ok(meta) => {
                     if let Ok(modified) = meta.modified() {
@@ -214,7 +216,8 @@ impl AnimeOfflineDatabase {
                 Ok(entries) => return Ok(entries),
                 Err(e) => {
                     tracing::warn!("Failed to download database: {}", e);
-                    if db_path.exists() {
+                    // Re-check existence asynchronously
+                    if fs::try_exists(&db_path).await.unwrap_or(false) {
                         tracing::info!("Using cached database instead");
                     } else {
                         return Err(e);

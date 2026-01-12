@@ -182,6 +182,7 @@ async fn add_virtual_folder(
         let cache_dir = state.config.paths.cache_dir.clone();
         let anime_db_enabled = state.config.anime_db_enabled;
 
+        let fetch_episode_metadata = state.config.fetch_episode_metadata;
         tokio::spawn(async move {
             tracing::info!(
                 "Starting automatic scan for new library '{}' at '{}'",
@@ -195,6 +196,7 @@ async fn add_virtual_folder(
                 &library_type,
                 cache_dir,
                 Some(anime_db_enabled),
+                Some(fetch_episode_metadata),
             )
             .await
             {
@@ -272,8 +274,19 @@ async fn refresh_library(
 
     // Spawn the scan in a background task so we don't block the response
     let pool = state.db.clone();
+    let cache_dir = state.config.paths.cache_dir.clone();
+    let anime_db_enabled = state.config.anime_db_enabled;
+    let fetch_episode_metadata = state.config.fetch_episode_metadata;
+
     tokio::spawn(async move {
-        if let Err(e) = scanner::refresh_all_libraries(&pool).await {
+        if let Err(e) = scanner::refresh_all_libraries_with_settings(
+            &pool,
+            cache_dir,
+            Some(anime_db_enabled),
+            Some(fetch_episode_metadata),
+        )
+        .await
+        {
             tracing::error!("Library refresh failed: {}", e);
         }
         // Also update any items missing media info

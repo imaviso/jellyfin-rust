@@ -282,7 +282,8 @@ impl AniDBClient {
         let local_filename = format!("{}.{}", image_type, ext);
         let local_path = item_cache_dir.join(&local_filename);
 
-        if local_path.exists() {
+        // Skip if already cached (use async check to avoid blocking)
+        if fs::try_exists(&local_path).await.unwrap_or(false) {
             return Ok(local_path);
         }
 

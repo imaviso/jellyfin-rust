@@ -117,10 +117,7 @@ async fn get_recommendations(
         }
         query_builder = query_builder.bind(item_limit);
 
-        let similar: Vec<MediaItem> = query_builder
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
+        let similar: Vec<MediaItem> = query_builder.fetch_all(&state.db).await.unwrap_or_default();
 
         if !similar.is_empty() {
             let items = convert_to_dtos(&state, &similar, &user.id).await;
@@ -190,10 +187,8 @@ async fn get_recommendations(
             }
             query_builder = query_builder.bind(&user.id).bind(item_limit);
 
-            let similar: Vec<MediaItem> = query_builder
-                .fetch_all(&state.db)
-                .await
-                .unwrap_or_default();
+            let similar: Vec<MediaItem> =
+                query_builder.fetch_all(&state.db).await.unwrap_or_default();
 
             if !similar.is_empty() {
                 let items = convert_to_dtos(&state, &similar, &user.id).await;
@@ -258,11 +253,7 @@ async fn get_recommendations(
 }
 
 /// Helper to convert MediaItems to BaseItemDto
-async fn convert_to_dtos(
-    state: &AppState,
-    items: &[MediaItem],
-    user_id: &str,
-) -> Vec<BaseItemDto> {
+async fn convert_to_dtos(state: &AppState, items: &[MediaItem], user_id: &str) -> Vec<BaseItemDto> {
     let mut dtos = Vec::with_capacity(items.len());
 
     for item in items {

@@ -270,7 +270,8 @@ async fn get_person_image(
 
     let cached_path = cache_dir.join(format!("{}.jpg", path.id));
 
-    if cached_path.exists() {
+    // Check if cached (use async to avoid blocking)
+    if tokio::fs::try_exists(&cached_path).await.unwrap_or(false) {
         // Serve from cache
         return serve_image_file(cached_path.to_str().unwrap()).await;
     }

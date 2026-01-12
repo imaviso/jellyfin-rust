@@ -410,7 +410,7 @@ async fn get_item_filters(
 
     Ok(Json(QueryFiltersLegacy {
         genres: genres.into_iter().map(|(g,)| g).collect(),
-        tags: vec![], // We don't have tags yet
+        tags: vec![],             // We don't have tags yet
         official_ratings: vec![], // We don't have ratings yet
         years: years.into_iter().map(|(y,)| y).collect(),
     }))
@@ -1953,13 +1953,41 @@ async fn refresh_item(
                     Err(e) => tracing::error!("Quick scan failed for {}: {}", lib.id, e),
                 }
             });
-        } else {
-            // ValidationOnly or FullRefresh: Full library scan with metadata
+        } else if is_validation_mode {
+            // ValidationOnly: Only scan items missing metadata (much faster than full scan)
             tracing::info!(
-                "Full refresh requested for library '{}' ({}) [mode={}]",
+                "Missing metadata scan requested for library '{}' ({})",
                 lib.name,
-                lib.id,
-                metadata_mode
+                lib.id
+            );
+            tokio::spawn(async move {
+                match crate::scanner::scan_missing_metadata(
+                    &db,
+                    &lib.id,
+                    config.paths.cache_dir,
+                    Some(config.anime_db_enabled),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Missing metadata scan for '{}': {}/{} series, {}/{} movies updated",
+                            lib.name,
+                            result.series_updated,
+                            result.series_scanned,
+                            result.movies_updated,
+                            result.movies_scanned
+                        );
+                    }
+                    Err(e) => tracing::error!("Missing metadata scan failed for {}: {}", lib.id, e),
+                }
+            });
+        } else {
+            // FullRefresh: Full library scan with metadata (rescans everything)
+            tracing::info!(
+                "Full refresh requested for library '{}' ({})",
+                lib.name,
+                lib.id
             );
             tokio::spawn(async move {
                 if let Err(e) = crate::scanner::scan_library_with_cache_dir(
@@ -1969,6 +1997,7 @@ async fn refresh_item(
                     &lib.library_type,
                     config.paths.cache_dir,
                     Some(config.anime_db_enabled),
+                    Some(config.fetch_episode_metadata),
                 )
                 .await
                 {
@@ -2698,14 +2727,20 @@ async fn download_remote_image(
     let file_path = cache_dir.join(&filename);
 
     // Download the image
-    tracing::info!("Downloading {} image for item {} from {}", image_type, id, image_url);
+    tracing::info!(
+        "Downloading {} image for item {} from {}",
+        image_type,
+        id,
+        image_url
+    );
 
     let client = reqwest::Client::new();
-    let response = client
-        .get(&image_url)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to download image: {}", e)))?;
+    let response = client.get(&image_url).send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to download image: {}", e),
+        )
+    })?;
 
     if !response.status().is_success() {
         return Err((
@@ -2714,15 +2749,20 @@ async fn download_remote_image(
         ));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to read image data: {}", e)))?;
+    let bytes = response.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read image data: {}", e),
+        )
+    })?;
 
     // Save the image file
-    tokio::fs::write(&file_path, &bytes)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save image: {}", e)))?;
+    tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save image: {}", e),
+        )
+    })?;
 
     // Store image reference in database
     let image_id = uuid::Uuid::new_v4().to_string();

@@ -70,6 +70,11 @@ pub struct MetadataConfig {
 
     /// Enable anime-offline-database for AniDB cross-referencing
     pub enable_anime_db: bool,
+
+    /// Fetch per-episode metadata from providers (default: false)
+    /// When disabled, episodes only get basic info (name, season/episode number)
+    /// Disabling reduces API calls significantly for large libraries
+    pub fetch_episode_metadata: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -118,6 +123,13 @@ pub struct ScannerConfig {
     /// Video file extensions to scan (lowercase, without dots)
     /// Default: mkv, mp4, avi, mov, wmv, flv, webm, m4v, mpg, mpeg, ts
     pub video_extensions: Vec<String>,
+
+    /// Interval in minutes to check for missing thumbnails (default: 60, 0 to disable)
+    /// This task finds episodes/movies without thumbnails and queues them for generation
+    pub missing_thumbnail_check_minutes: u64,
+
+    /// Whether to automatically retry failed thumbnail generations (default: true)
+    pub retry_failed_thumbnails: bool,
 }
 
 impl Default for ScannerConfig {
@@ -154,6 +166,8 @@ impl Default for ScannerConfig {
                 "3g2".to_string(),
                 "f4v".to_string(),
             ],
+            missing_thumbnail_check_minutes: 60,
+            retry_failed_thumbnails: true,
         }
     }
 }
@@ -339,6 +353,9 @@ pub struct AppConfig {
     /// Whether anime offline database is enabled
     pub anime_db_enabled: bool,
 
+    /// Whether to fetch per-episode metadata
+    pub fetch_episode_metadata: bool,
+
     /// Path to ffmpeg binary
     pub ffmpeg_path: Option<PathBuf>,
 
@@ -389,6 +406,7 @@ impl AppConfig {
             bind_address: Self::env_bind_address().unwrap_or_else(|| "0.0.0.0".to_string()),
             tmdb_api_key: std::env::var("TMDB_API_KEY").ok(),
             anime_db_enabled: Self::env_anime_db_enabled(),
+            fetch_episode_metadata: Self::env_fetch_episode_metadata(),
             ffmpeg_path: std::env::var("FFMPEG_PATH").ok().map(PathBuf::from),
             ffprobe_path: std::env::var("FFPROBE_PATH").ok().map(PathBuf::from),
             libraries: Vec::new(),
@@ -473,6 +491,13 @@ impl AppConfig {
             config_file.metadata.enable_anime_db
         };
 
+        // Fetch episode metadata: env > config
+        let fetch_episode_metadata = if std::env::var("FETCH_EPISODE_METADATA").is_ok() {
+            Self::env_fetch_episode_metadata()
+        } else {
+            config_file.metadata.fetch_episode_metadata
+        };
+
         // FFmpeg path: env > config
         let ffmpeg_path = std::env::var("FFMPEG_PATH")
             .ok()
@@ -491,6 +516,7 @@ impl AppConfig {
             bind_address,
             tmdb_api_key,
             anime_db_enabled,
+            fetch_episode_metadata,
             ffmpeg_path,
             ffprobe_path,
             libraries: config_file.libraries,
@@ -510,6 +536,12 @@ impl AppConfig {
 
     fn env_anime_db_enabled() -> bool {
         std::env::var("ENABLE_ANIME_DB")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+    }
+
+    fn env_fetch_episode_metadata() -> bool {
+        std::env::var("FETCH_EPISODE_METADATA")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false)
     }
@@ -535,6 +567,12 @@ impl AppConfig {
             tracing::info!("Anime offline database: ENABLED");
         } else {
             tracing::debug!("Anime offline database: disabled");
+        }
+
+        if self.fetch_episode_metadata {
+            tracing::info!("Episode metadata fetching: ENABLED");
+        } else {
+            tracing::debug!("Episode metadata fetching: disabled (reduces API calls)");
         }
 
         if let Some(ref path) = self.ffmpeg_path {
