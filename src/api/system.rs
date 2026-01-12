@@ -19,6 +19,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/Configuration", get(get_configuration))
         .route("/Restart", post(restart_server))
         .route("/Shutdown", post(shutdown_server))
+        .route("/Ping", get(ping))
+        .route("/Ping", post(ping))
 }
 
 #[derive(Serialize)]
@@ -271,4 +273,10 @@ async fn shutdown_server(
     });
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET/POST /System/Ping - Server alive check
+/// Returns "Jellyfin Server" as plain text (per Jellyfin spec)
+async fn ping() -> &'static str {
+    "Jellyfin Server"
 }

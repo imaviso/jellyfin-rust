@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/", get(get_users))
         .route("/Public", get(get_public_users))
         .route("/Me", get(get_current_user))
+        .route("/New", post(create_user))
+        .route("/:userId", get(get_user_by_id))
+        .route("/:userId", delete(delete_user))
 }
 
 /// User image routes - mounted at /Users/:userId/Images
@@ -323,4 +326,210 @@ async fn get_user_image(Path((_user_id, _image_type)): Path<(String, String)>) -
     // User images not supported - return 404
     // Client handles this gracefully and shows default avatar
     StatusCode::NOT_FOUND
+}
+
+/// GET /Users/:userId - Get a specific user by ID
+async fn get_user_by_id(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<Json<UserDto>, (StatusCode, String)> {
+    // Verify authentication
+    let (_, _, _, token) = parse_emby_auth_header(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing auth header".to_string()))?;
+
+    let token = token.ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
+
+    auth::validate_session(&state.db, &token)
+        .await
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+
+    // Get the specific user
+    let user: crate::models::User = sqlx::query_as("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "User not found".to_string()))?;
+
+    Ok(Json(UserDto {
+        id: user.id,
+        name: user.name,
+        server_id: "jellyfin-rust-server".to_string(),
+        has_password: true,
+        has_configured_password: true,
+        enable_auto_login: false,
+        policy: UserPolicy {
+            is_administrator: user.is_admin,
+            ..Default::default()
+        },
+        configuration: UserConfiguration::default(),
+    }))
+}
+
+/// DELETE /Users/:userId - Delete a user
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Verify admin authentication
+    let (_, _, _, token) = parse_emby_auth_header(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing auth header".to_string()))?;
+
+    let token = token.ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
+
+    let current_user = auth::validate_session(&state.db, &token)
+        .await
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+
+    // Only admins can delete users
+    if !current_user.is_admin {
+        return Err((StatusCode::FORBIDDEN, "Admin required".to_string()));
+    }
+
+    // Cannot delete yourself
+    if current_user.id == user_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Cannot delete your own account".to_string(),
+        ));
+    }
+
+    // Check if user exists
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, "User not found".to_string()));
+    }
+
+    // Delete user's sessions first
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(&user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete user's playback progress
+    sqlx::query("DELETE FROM playback_progress WHERE user_id = ?")
+        .bind(&user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete user's favorites
+    sqlx::query("DELETE FROM user_favorites WHERE user_id = ?")
+        .bind(&user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete the user
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tracing::info!("User {} deleted by admin {}", user_id, current_user.id);
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request body for creating a new user
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CreateUserRequest {
+    pub name: String,
+    pub password: Option<String>,
+}
+
+/// Response for created user
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CreateUserResponse {
+    pub id: String,
+    pub name: String,
+    pub server_id: String,
+    pub has_password: bool,
+    pub has_configured_password: bool,
+    pub policy: UserPolicy,
+    pub configuration: UserConfiguration,
+}
+
+/// POST /Users/New - Create a new user
+async fn create_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<Json<CreateUserResponse>, (StatusCode, String)> {
+    // Verify admin authentication
+    let (_, _, _, token) = parse_emby_auth_header(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing auth header".to_string()))?;
+
+    let token = token.ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
+
+    let current_user = auth::validate_session(&state.db, &token)
+        .await
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+
+    // Only admins can create users
+    if !current_user.is_admin {
+        return Err((StatusCode::FORBIDDEN, "Admin required".to_string()));
+    }
+
+    // Validate name
+    if req.name.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Name is required".to_string()));
+    }
+
+    // Check if username already exists
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE LOWER(name) = LOWER(?)")
+        .bind(&req.name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if exists.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "A user with that name already exists".to_string(),
+        ));
+    }
+
+    // Generate user ID and hash password
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let password = req.password.unwrap_or_default();
+    let password_hash = auth::hash_password(&password)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to hash password: {}", e)))?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Create the user
+    sqlx::query(
+        "INSERT INTO users (id, name, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(&req.name)
+    .bind(&password_hash)
+    .bind(false) // New users are not admins by default
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tracing::info!("User '{}' created by admin {}", req.name, current_user.id);
+
+    Ok(Json(CreateUserResponse {
+        id: user_id,
+        name: req.name,
+        server_id: "jellyfin-rust-server".to_string(),
+        has_password: !password.is_empty(),
+        has_configured_password: !password.is_empty(),
+        policy: UserPolicy::default(),
+        configuration: UserConfiguration::default(),
+    }))
 }

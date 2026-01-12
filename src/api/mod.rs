@@ -13,6 +13,7 @@ mod images;
 mod items;
 mod library;
 mod localization;
+mod movies;
 mod persons;
 mod playback;
 mod playbackinfo;
@@ -37,6 +38,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .nest("/Items", items::routes())
         .nest("/Items", images::routes()) // Image routes under /Items/:id/Images
         .nest("/Items", playbackinfo::routes()) // PlaybackInfo under /Items/:id/PlaybackInfo
+        .nest("/Items", subtitles::search_routes()) // Subtitle search under /Items/:id/RemoteSearch/Subtitles
         .nest("/Search", items::search_routes()) // Search hints
         .nest("/Videos", videos::routes())
         .nest("/Videos", subtitles::routes()) // Subtitle routes under /Videos/:id/:id/Subtitles
@@ -44,6 +46,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .nest("/Sessions", playback::routes()) // Playback reporting (Playing, Progress, Stopped)
         .nest("/Shows", shows::routes()) // Shows endpoints (Seasons, Episodes)
         .nest("/Shows/NextUp", home::next_up_routes()) // NextUp endpoint
+        .nest("/Movies", movies::routes()) // Movie recommendations
         .nest("/UserViews", views::routes()) // User library views
         .nest("/UserItems/Resume", home::resume_routes()) // Resume watching
         .nest("/QuickConnect", stubs::quick_connect_routes()) // QuickConnect stub

@@ -8,7 +8,7 @@ This server aims for compatibility with Jellyfin clients, particularly **Fladder
 
 ---
 
-## Authentication
+## Authentication & Users
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -16,6 +16,9 @@ This server aims for compatibility with Jellyfin clients, particularly **Fladder
 | GET | `/Users/Me` | Get current authenticated user |
 | GET | `/Users` | List all users (admin) |
 | GET | `/Users/Public` | List public users for login screen |
+| GET | `/Users/{userId}` | Get specific user by ID |
+| POST | `/Users/New` | Create new user (admin) |
+| DELETE | `/Users/{userId}` | Delete user (admin) |
 | POST | `/Sessions/Logout` | Logout current session |
 
 ---
@@ -31,6 +34,7 @@ This server aims for compatibility with Jellyfin clients, particularly **Fladder
 | GET | `/System/Info/Public` | Public system info (no auth required) |
 | GET | `/System/Info/Storage` | Storage/disk usage info (admin) |
 | GET | `/System/Configuration` | Server configuration |
+| GET/POST | `/System/Ping` | Server ping (returns "Jellyfin Server") |
 | POST | `/System/Restart` | Restart server (admin) |
 | POST | `/System/Shutdown` | Shutdown server (admin) |
 
@@ -65,13 +69,29 @@ This server aims for compatibility with Jellyfin clients, particularly **Fladder
 |--------|----------|-------------|
 | GET | `/Items` | Query items with filters |
 | GET | `/Items/Counts` | Get item counts by type (movies, series, episodes) |
+| GET | `/Items/Filters` | Get filter values (genres, years) - legacy format |
+| GET | `/Items/Filters2` | Get filter values with IDs - new format |
 | GET | `/Items/{id}` | Get single item details |
+| DELETE | `/Items/{id}` | Delete item (admin) |
 | GET | `/Items/{id}/Similar` | Get similar items (by genre) |
 | POST | `/Items/{id}/Refresh` | Refresh item/library metadata |
+| GET | `/Items/{id}/Download` | Download media file |
+| GET | `/Items/{id}/RemoteImages` | Search for remote images |
+| POST | `/Items/{id}/RemoteImages/Download` | Download and save remote image |
+| GET | `/Items/{id}/ExternalIdInfos` | Get external ID info (IMDB, TMDB, AniList) |
+| GET | `/Items/{id}/MetadataEditor` | Get metadata editor info |
 | GET | `/Users/{userId}/Items` | Query items for a user |
 | GET | `/Users/{userId}/Items/{itemId}` | Get item with user data |
 | GET | `/Users/{userId}/Items/Latest` | Get latest added items |
 | GET | `/Search/Hints` | Search items by query |
+
+### Remote Search
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/Items/RemoteSearch/Series` | Search for series metadata |
+| POST | `/Items/RemoteSearch/Movie` | Search for movie metadata |
+| POST | `/Items/RemoteSearch/Apply/{id}` | Apply remote search result to item |
 
 ### Item Refresh Modes
 
@@ -105,6 +125,14 @@ Image types: `Primary`, `Backdrop`, `Banner`, `Thumb`, `Logo`
 
 ---
 
+## Movies
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/Movies/Recommendations` | Get movie recommendations based on favorites, watch history, and genres |
+
+---
+
 ## Playback
 
 | Method | Endpoint | Description |
@@ -116,6 +144,18 @@ Image types: `Primary`, `Backdrop`, `Banner`, `Thumb`, `Logo`
 | GET | `/Videos/{id}/original` | Direct stream original file |
 | GET | `/Videos/{id}/original.{container}` | Direct stream with container |
 | GET | `/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}` | Get subtitle stream |
+
+---
+
+## Subtitles
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/Videos/{id}/{mediaSourceId}/Subtitles/{index}/Stream.{format}` | Get embedded subtitle stream |
+| GET | `/Items/{id}/RemoteSearch/Subtitles/{language}` | Search for subtitles (OpenSubtitles) |
+| POST | `/Items/{id}/RemoteSearch/Subtitles/{subtitleId}` | Download subtitle |
+
+Subtitle search requires `OPENSUBTITLES_API_KEY` environment variable.
 
 ---
 
@@ -273,16 +313,19 @@ The following Jellyfin APIs are **not yet implemented**:
 
 | API | Endpoint | Notes |
 |-----|----------|-------|
-| Movie Recommendations | `/Movies/Recommendations` | Planned |
-| Remote Images | `/Items/{id}/RemoteImages` | Search for remote images |
-| Item Download | `/Items/{id}/Download` | Download media files |
-| Trickplay | `/Videos/{id}/Trickplay/*` | Seek preview thumbnails |
-| External IDs | `/Items/{id}/ExternalIdInfos` | AniList/MAL/TMDB IDs |
+| Trickplay | `/Videos/{id}/Trickplay/*` | Seek preview thumbnails (returns 404) |
 | Activity Log | `/System/ActivityLog/Entries` | Activity logging |
 | Notifications | `/Notifications` | User notifications |
+| User Password | `/Users/Password` | Change password |
+| Devices | `/Devices`, `/Devices/Info` | Device management |
+| QuickConnect | `/QuickConnect/*` | TV login (stub returns false) |
 | Live TV | `/LiveTv/*` | Not planned |
-| Sync | `/Sync/*` | Not planned |
-| Devices | `/Devices` | Device management |
+| SyncPlay | `/SyncPlay/*` | Not planned |
+| Audio Streaming | `/Audio/{id}/stream` | Music support |
+| Artists | `/Artists`, `/Artists/{name}` | Music support |
+| Music Genres | `/MusicGenres` | Music support |
+| Plugins | `/Plugins/*` | Plugin management |
+| Packages | `/Packages/*` | Package management |
 
 ---
 
@@ -291,7 +334,8 @@ The following Jellyfin APIs are **not yet implemented**:
 Currently supported metadata providers:
 
 - **AniList** - Anime series metadata and images
-- **TMDB** - Movies and TV series (requires API key in config)
+- **TMDB** - Movies and TV series (requires `TMDB_API_KEY` env var)
+- **OpenSubtitles** - Subtitle search (requires `OPENSUBTITLES_API_KEY` env var)
 
 Person/cast data is fetched from:
 - AniList (voice actors for anime)

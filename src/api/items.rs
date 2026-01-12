@@ -204,11 +204,18 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(get_items))
         .route("/Counts", get(get_item_counts))
+        .route("/Filters", get(get_item_filters))
+        .route("/Filters2", get(get_item_filters2))
         .route("/:id", get(get_item))
+        .route("/:id", axum::routing::delete(delete_item))
         .route("/:id/Similar", get(get_similar_items))
         .route("/:id/Refresh", axum::routing::post(refresh_item))
         .route("/:id/Download", get(download_item))
         .route("/:id/RemoteImages", get(get_remote_images))
+        .route(
+            "/:id/RemoteImages/Download",
+            axum::routing::post(download_remote_image),
+        )
         .route("/:id/ExternalIdInfos", get(get_external_id_infos))
         .route("/:id/MetadataEditor", get(get_metadata_editor))
         .route(
@@ -307,6 +314,276 @@ async fn get_item_counts(
         book_count: 0,
         item_count: total_count,
     }))
+}
+
+// =============================================================================
+// Item Filters
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct QueryFiltersLegacy {
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+    pub official_ratings: Vec<String>,
+    pub years: Vec<i32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct QueryFilters {
+    pub genres: Vec<NameGuidPair>,
+    pub tags: Vec<String>,
+    pub official_ratings: Vec<String>,
+    pub years: Vec<i32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct NameGuidPair {
+    pub name: String,
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiltersQuery {
+    pub user_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub include_item_types: Option<String>,
+    pub is_airing: Option<bool>,
+    pub is_movie: Option<bool>,
+    pub is_sports: Option<bool>,
+    pub is_kids: Option<bool>,
+    pub is_news: Option<bool>,
+    pub is_series: Option<bool>,
+    pub recursive: Option<bool>,
+}
+
+/// GET /Items/Filters - Get filter values (legacy format)
+async fn get_item_filters(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<FiltersQuery>,
+) -> Result<Json<QueryFiltersLegacy>, (StatusCode, String)> {
+    let _user = require_auth(&state, &headers).await?;
+
+    // Get distinct genres
+    let genres: Vec<(String,)> = if let Some(ref parent_id) = query.parent_id {
+        sqlx::query_as(
+            "SELECT DISTINCT g.name FROM genres g 
+             INNER JOIN item_genres ig ON g.id = ig.genre_id 
+             INNER JOIN media_items m ON ig.item_id = m.id 
+             WHERE m.library_id = ? 
+             ORDER BY g.name",
+        )
+        .bind(parent_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as("SELECT DISTINCT name FROM genres ORDER BY name")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default()
+    };
+
+    // Get distinct years
+    let years: Vec<(i32,)> = if let Some(ref parent_id) = query.parent_id {
+        sqlx::query_as(
+            "SELECT DISTINCT year FROM media_items 
+             WHERE library_id = ? AND year IS NOT NULL 
+             ORDER BY year DESC",
+        )
+        .bind(parent_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as(
+            "SELECT DISTINCT year FROM media_items WHERE year IS NOT NULL ORDER BY year DESC",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    };
+
+    Ok(Json(QueryFiltersLegacy {
+        genres: genres.into_iter().map(|(g,)| g).collect(),
+        tags: vec![], // We don't have tags yet
+        official_ratings: vec![], // We don't have ratings yet
+        years: years.into_iter().map(|(y,)| y).collect(),
+    }))
+}
+
+/// GET /Items/Filters2 - Get filter values (new format with IDs)
+async fn get_item_filters2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<FiltersQuery>,
+) -> Result<Json<QueryFilters>, (StatusCode, String)> {
+    let _user = require_auth(&state, &headers).await?;
+
+    // Get genres with IDs
+    let genres: Vec<(String, String)> = if let Some(ref parent_id) = query.parent_id {
+        sqlx::query_as(
+            "SELECT DISTINCT g.name, g.id FROM genres g 
+             INNER JOIN item_genres ig ON g.id = ig.genre_id 
+             INNER JOIN media_items m ON ig.item_id = m.id 
+             WHERE m.library_id = ? 
+             ORDER BY g.name",
+        )
+        .bind(parent_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as("SELECT name, id FROM genres ORDER BY name")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default()
+    };
+
+    // Get distinct years
+    let years: Vec<(i32,)> = if let Some(ref parent_id) = query.parent_id {
+        sqlx::query_as(
+            "SELECT DISTINCT year FROM media_items 
+             WHERE library_id = ? AND year IS NOT NULL 
+             ORDER BY year DESC",
+        )
+        .bind(parent_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as(
+            "SELECT DISTINCT year FROM media_items WHERE year IS NOT NULL ORDER BY year DESC",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    };
+
+    Ok(Json(QueryFilters {
+        genres: genres
+            .into_iter()
+            .map(|(name, id)| NameGuidPair { name, id })
+            .collect(),
+        tags: vec![],
+        official_ratings: vec![],
+        years: years.into_iter().map(|(y,)| y).collect(),
+    }))
+}
+
+// =============================================================================
+// Delete Item
+// =============================================================================
+
+/// DELETE /Items/{id} - Delete an item and its associated data
+async fn delete_item(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Require admin for deletion
+    let (_, _, _, token) = parse_emby_auth_header(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing auth header".to_string()))?;
+
+    let token = token.ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
+
+    let user = auth::validate_session(&state.db, &token)
+        .await
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+
+    if !user.is_admin {
+        return Err((StatusCode::FORBIDDEN, "Admin required".to_string()));
+    }
+
+    // Check if item exists
+    let item: Option<MediaItem> = sqlx::query_as("SELECT * FROM media_items WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if item.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Item not found".to_string()));
+    }
+
+    // Delete associated data
+    // Delete images
+    sqlx::query("DELETE FROM images WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete playback progress
+    sqlx::query("DELETE FROM playback_progress WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete favorites
+    sqlx::query("DELETE FROM user_favorites WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete genre links
+    sqlx::query("DELETE FROM item_genres WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete studio links
+    sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete person links
+    sqlx::query("DELETE FROM item_persons WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete media segments
+    sqlx::query("DELETE FROM media_segments WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete collection items
+    sqlx::query("DELETE FROM collection_items WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Delete playlist items
+    sqlx::query("DELETE FROM playlist_items WHERE item_id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Finally, delete the item itself
+    sqlx::query("DELETE FROM media_items WHERE id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tracing::info!("Item {} deleted by admin {}", id, user.id);
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // =============================================================================
@@ -2363,6 +2640,113 @@ async fn get_remote_images(
         total_record_count: total,
         providers,
     }))
+}
+
+// =============================================================================
+// Download Remote Image
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadRemoteImageQuery {
+    #[serde(rename = "type")]
+    pub image_type: String,
+    pub image_url: Option<String>,
+}
+
+/// POST /Items/:id/RemoteImages/Download - Download and save a remote image
+async fn download_remote_image(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<DownloadRemoteImageQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _user = require_auth(&state, &headers).await?;
+
+    // Get the item to verify it exists
+    let item: MediaItem = sqlx::query_as("SELECT * FROM media_items WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Item not found".to_string()))?;
+
+    let image_url = query.image_url.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "imageUrl query parameter is required".to_string(),
+        )
+    })?;
+
+    // Determine the image type (Primary, Backdrop, etc.)
+    let image_type = &query.image_type;
+
+    // Create cache directory for images
+    let cache_dir = state.config.paths.cache_dir.join("images").join(&id);
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Determine file extension from URL or default to jpg
+    let extension = image_url
+        .rsplit('.')
+        .next()
+        .filter(|ext| ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.to_lowercase().as_str()))
+        .unwrap_or("jpg");
+
+    let filename = format!("{}.{}", image_type.to_lowercase(), extension);
+    let file_path = cache_dir.join(&filename);
+
+    // Download the image
+    tracing::info!("Downloading {} image for item {} from {}", image_type, id, image_url);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&image_url)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to download image: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Image download failed with status: {}", response.status()),
+        ));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to read image data: {}", e)))?;
+
+    // Save the image file
+    tokio::fs::write(&file_path, &bytes)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save image: {}", e)))?;
+
+    // Store image reference in database
+    let image_id = uuid::Uuid::new_v4().to_string();
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO images (id, item_id, image_type, path) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&image_id)
+    .bind(&id)
+    .bind(image_type)
+    .bind(&file_path_str)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tracing::info!(
+        "Downloaded and saved {} image for item {} to {}",
+        image_type,
+        id,
+        file_path_str
+    );
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // =============================================================================
