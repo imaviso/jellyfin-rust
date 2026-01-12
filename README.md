@@ -4,7 +4,7 @@ A lightweight Jellyfin-compatible media server written in Rust. Designed for per
 
 ## Features
 
-- **Jellyfin API compatible** - Works with Jellyfin clients (Fladder, Jellyfin Media Player, etc.)
+- **Jellyfin API compatible** - Works with Jellyfin clients
 - **Anime-focused metadata** - AniList, Jikan (MyAnimeList), AniDB, anime-offline-database
 - **TMDB integration** - For movies and non-anime series
 - **Auto thumbnail generation** - Extracts frames from videos via ffmpeg
@@ -12,6 +12,17 @@ A lightweight Jellyfin-compatible media server written in Rust. Designed for per
 - **SQLite database** - Simple, portable storage
 - **Direct play only** - No transcoding overhead
 - **Memory efficient** - Automatically unloads large datasets after scans
+
+## Tested Clients
+
+| Client | Platform | Status |
+|--------|----------|--------|
+| [Fladder](https://github.com/DonutWare/Fladder) | Android, iOS, Desktop | ✅ Fully tested and supported |
+| Jellyfin Media Player | Desktop | ⚠️ Should work (untested) |
+| Jellyfin Mobile | Android, iOS | ⚠️ Should work (untested) |
+| Jellyfin Web | Browser | ⚠️ Partial (no transcoding) |
+
+> **Note**: This server is primarily developed and tested with **Fladder**. Other Jellyfin clients should work but may have compatibility issues.
 
 ## Requirements
 
